@@ -1,0 +1,10 @@
+[workspace]
+members = [
+    "teamserver",
+    "shared",
+]
+exclude = [
+    "tauri-client",
+    "agent"
+]
+resolver = "2"

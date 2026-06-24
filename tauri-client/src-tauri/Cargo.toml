@@ -1,0 +1,16 @@
+[package]
+name = "nagomio-client"
+version = "0.1.0"
+description = "Nagomio C2 operator client"
+authors = ["Nagomio"]
+edition = "2021"
+
+[build-dependencies]
+image = "0.25"
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]
