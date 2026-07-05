@@ -69,6 +69,18 @@ export type PayloadArtifact = {
   ua_randomize?: boolean;
   sleep_obfuscate?: boolean;
   encrypt_payload?: boolean;
+  wire_encryption?: boolean;
+  profile?: string;
+  sni_override?: string | null;
+};
+
+export type AuditEntry = {
+  id: number;
+  timestamp_unix: number;
+  source_ip: string;
+  action: string;
+  agent_id: string | null;
+  task_id: string | null;
 };
 
 export type OperationsStats = {

@@ -153,7 +153,7 @@ export const consoleCommands: ConsoleCommand[] = [
     run: (args) => ({
       type: "queue",
       label: "ls",
-      task: { command: "__nagomio_file_list", arguments: [args[0] || "."], preview: `ls ${args[0] || "."}` }
+      task: { command: "file_list", arguments: [args[0] || "."], preview: `ls ${args[0] || "."}` }
     })
   },
   {
@@ -182,7 +182,7 @@ export const consoleCommands: ConsoleCommand[] = [
       return {
         type: "queue",
         label: "download",
-        task: { command: "__nagomio_file_download", arguments: [args[0]], preview: `download ${args[0]}` }
+        task: { command: "file_download", arguments: [args[0]], preview: `download ${args[0]}` }
       };
     }
   },
@@ -204,7 +204,7 @@ export const consoleCommands: ConsoleCommand[] = [
     run: (args) => {
       const error = requireArgs(args, 1, "rm <remote-path>");
       if (error) return { type: "local", output: error };
-      return { type: "queue", label: "rm", task: { command: "__nagomio_file_delete", arguments: [args[0]], preview: `rm ${args[0]}` } };
+      return { type: "queue", label: "rm", task: { command: "file_delete", arguments: [args[0]], preview: `rm ${args[0]}` } };
     }
   },
   {
@@ -215,7 +215,7 @@ export const consoleCommands: ConsoleCommand[] = [
     run: (args) => {
       const error = requireArgs(args, 2, "mv <source> <destination>");
       if (error) return { type: "local", output: error };
-      return { type: "queue", label: "mv", task: { command: "__nagomio_file_rename", arguments: [args[0], args[1]], preview: `mv ${args[0]} ${args[1]}` } };
+      return { type: "queue", label: "mv", task: { command: "file_rename", arguments: [args[0], args[1]], preview: `mv ${args[0]} ${args[1]}` } };
     }
   },
   {
@@ -225,7 +225,7 @@ export const consoleCommands: ConsoleCommand[] = [
     run: (args) => {
       const error = requireArgs(args, 1, "mkdir <remote-path>");
       if (error) return { type: "local", output: error };
-      return { type: "queue", label: "mkdir", task: { command: "__nagomio_file_mkdir", arguments: [args[0]], preview: `mkdir ${args[0]}` } };
+      return { type: "queue", label: "mkdir", task: { command: "file_mkdir", arguments: [args[0]], preview: `mkdir ${args[0]}` } };
     }
   },
   {

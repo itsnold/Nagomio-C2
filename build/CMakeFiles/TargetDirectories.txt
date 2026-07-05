@@ -1,0 +1,3 @@
+/home/itsnold/Projects/build/CMakeFiles/nagomio-agent.dir
+/home/itsnold/Projects/build/CMakeFiles/edit_cache.dir
+/home/itsnold/Projects/build/CMakeFiles/rebuild_cache.dir

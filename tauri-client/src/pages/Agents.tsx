@@ -48,12 +48,12 @@ export function Agents() {
       if (script.includes("Get-Process") || script === "ps aux") return "ps";
       return script;
     }
-    if (task.task.command === "__nagomio_file_list") return `ls ${task.task.arguments[0] || "."}`;
-    if (task.task.command === "__nagomio_file_download") return `download ${task.task.arguments[0] || ""}`;
-    if (task.task.command === "__nagomio_file_upload") return `upload ${task.task.arguments[0] || ""}`;
-    if (task.task.command === "__nagomio_file_delete") return `rm ${task.task.arguments[0] || ""}`;
-    if (task.task.command === "__nagomio_file_rename") return `mv ${task.task.arguments[0] || ""} ${task.task.arguments[1] || ""}`;
-    if (task.task.command === "__nagomio_file_mkdir") return `mkdir ${task.task.arguments[0] || ""}`;
+    if (task.task.command === "file_list") return `ls ${task.task.arguments[0] || "."}`;
+    if (task.task.command === "file_download") return `download ${task.task.arguments[0] || ""}`;
+    if (task.task.command === "file_upload") return `upload ${task.task.arguments[0] || ""}`;
+    if (task.task.command === "file_delete") return `rm ${task.task.arguments[0] || ""}`;
+    if (task.task.command === "file_rename") return `mv ${task.task.arguments[0] || ""} ${task.task.arguments[1] || ""}`;
+    if (task.task.command === "file_mkdir") return `mkdir ${task.task.arguments[0] || ""}`;
     return [task.task.command, ...task.task.arguments].join(" ");
   }
   const eventItems = [
@@ -179,7 +179,7 @@ export function Agents() {
     for (let index = 0; index < bytes.length; index += chunkSize) {
       binary += String.fromCharCode(...bytes.slice(index, index + chunkSize));
     }
-    await queueAgentTask("__nagomio_file_upload", [pendingUploadPath, window.btoa(binary)], `upload ${file.name}`);
+    await queueAgentTask("file_upload", [pendingUploadPath, window.btoa(binary)], `upload ${file.name}`);
     setPendingUploadPath("");
   }
 
