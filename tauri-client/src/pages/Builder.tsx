@@ -13,6 +13,13 @@ const formatOptions = [
   { value: "shellcode", label: "Shellcode (.bin)", meta: "Raw Position Independent Code" }
 ];
 
+const profileOptions = [
+  { value: "default", label: "Default", meta: "/beacon · /response" },
+  { value: "cdn_metrics", label: "CDN Metrics", meta: "Looks like /api/v2/metrics" },
+  { value: "analytics", label: "Analytics", meta: "Looks like /track" },
+  { value: "dead_drop", label: "Dead Drop", meta: "Pulls tasks from a public file" }
+];
+
 type BuildPhase = "idle" | "preparing" | "configuring" | "compiling" | "saving" | "succeeded" | "failed";
 
 const buildPhaseLabels: Record<BuildPhase, string> = {
@@ -63,6 +70,13 @@ export function Builder() {
   const [staticRuntime, setStaticRuntime] = useState(true);
   const [xorConfig, setXorConfig] = useState(true);
   const [xorKey, setXorKey] = useState(90);
+  const [wireEncryption, setWireEncryption] = useState(true);
+  const [killDateEpoch, setKillDateEpoch] = useState(0);
+  const [uaRandomize, setUaRandomize] = useState(true);
+  const [sleepObfuscate, setSleepObfuscate] = useState(false);
+  const [encryptPayload, setEncryptPayload] = useState(false);
+  const [profile, setProfile] = useState("default");
+  const [sniOverride, setSniOverride] = useState("");
   const [buildPhase, setBuildPhase] = useState<BuildPhase>("idle");
   const [buildStartedAt, setBuildStartedAt] = useState<number | null>(null);
   const [buildElapsed, setBuildElapsed] = useState(0);
@@ -137,7 +151,14 @@ export function Builder() {
           xor_config: xorConfig,
           xor_key: xorKey,
           target_os: targetOs,
-          format: outputFormat
+          format: outputFormat,
+          kill_date_epoch: killDateEpoch || null,
+          ua_randomize: uaRandomize,
+          sleep_obfuscate: sleepObfuscate,
+          encrypt_payload: encryptPayload,
+          wire_encryption: wireEncryption,
+          profile: profile === "default" ? null : profile,
+          sni_override: sniOverride.trim() || null
         })
       });
       clearPhaseTimers();
@@ -235,12 +256,40 @@ export function Builder() {
               <input type="checkbox" checked={xorConfig} onChange={(e) => setXorConfig(e.target.checked)} />
               <span><FaShieldAlt /> XOR Config</span>
             </label>
+            <label className="option-card">
+              <input type="checkbox" checked={wireEncryption} onChange={(e) => setWireEncryption(e.target.checked)} />
+              <span><FaShieldAlt /> Wire Encryption</span>
+            </label>
+            <label className="option-card">
+              <input type="checkbox" checked={uaRandomize} onChange={(e) => setUaRandomize(e.target.checked)} />
+              <span><FaShieldAlt /> Randomize UA</span>
+            </label>
+            <label className="option-card">
+              <input type="checkbox" checked={sleepObfuscate} onChange={(e) => setSleepObfuscate(e.target.checked)} />
+              <span><FaShieldAlt /> Sleep Obfuscation</span>
+            </label>
+            <label className="option-card">
+              <input type="checkbox" checked={encryptPayload} onChange={(e) => setEncryptPayload(e.target.checked)} />
+              <span><FaShieldAlt /> Encrypt Artifact</span>
+            </label>
           </div>
 
           <div className="form-grid">
             <label>
               <span>XOR Key</span>
               <input min={1} max={255} type="number" value={xorKey} disabled={!xorConfig} onChange={(e) => setXorKey(Number(e.target.value))} />
+            </label>
+            <label>
+              <span>Kill Date Epoch (0 = none)</span>
+              <input min={0} type="number" value={killDateEpoch} onChange={(e) => setKillDateEpoch(Number(e.target.value))} />
+            </label>
+            <label>
+              <span>Profile</span>
+              <DarkSelect value={profile} onChange={setProfile} options={profileOptions} />
+            </label>
+            <label className="wide-field">
+              <span>SNI Override (optional, for domain fronting)</span>
+              <input value={sniOverride} placeholder="clean.cdn.example" onChange={(e) => setSniOverride(e.target.value)} />
             </label>
           </div>
 

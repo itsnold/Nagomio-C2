@@ -108,7 +108,7 @@ export function FileBrowser({ agentId, platform, tasks, responses, loading, queu
   const listState = useMemo(() => {
     const responseList = Object.values(responses).flat();
     const listTasks = tasks
-      .filter((task) => task.agent_id === agentId && task.task.command === "__nagomio_file_list")
+      .filter((task) => task.agent_id === agentId && task.task.command === "file_list")
       .sort((left, right) => right.created_at_unix - left.created_at_unix);
 
     for (const task of listTasks) {
@@ -133,7 +133,7 @@ export function FileBrowser({ agentId, platform, tasks, responses, loading, queu
 
   async function list(path = currentPath) {
     setCurrentPath(path);
-    await queueTask("__nagomio_file_list", [path], `List ${path}`);
+    await queueTask("file_list", [path], `List ${path}`);
   }
 
   async function upload(event: React.ChangeEvent<HTMLInputElement>) {
@@ -142,24 +142,24 @@ export function FileBrowser({ agentId, platform, tasks, responses, loading, queu
     if (!file) return;
     const content = await toBase64(file);
     const remotePath = joinRemotePath(currentPath, file.name, platform);
-    await queueTask("__nagomio_file_upload", [remotePath, content], `Upload ${file.name}`);
+    await queueTask("file_upload", [remotePath, content], `Upload ${file.name}`);
   }
 
   async function rename(entry: FileEntry) {
     const nextName = window.prompt("Rename to", entry.name);
     if (!nextName?.trim()) return;
-    await queueTask("__nagomio_file_rename", [entry.path, joinRemotePath(currentPath, nextName.trim(), platform)], `Rename ${entry.name}`);
+    await queueTask("file_rename", [entry.path, joinRemotePath(currentPath, nextName.trim(), platform)], `Rename ${entry.name}`);
   }
 
   async function remove(entry: FileEntry) {
     if (!window.confirm(`Delete ${entry.path}?`)) return;
-    await queueTask("__nagomio_file_delete", [entry.path], `Delete ${entry.name}`);
+    await queueTask("file_delete", [entry.path], `Delete ${entry.name}`);
   }
 
   async function mkdir() {
     const name = window.prompt("Directory name");
     if (!name?.trim()) return;
-    await queueTask("__nagomio_file_mkdir", [joinRemotePath(currentPath, name.trim(), platform)], `Create ${name.trim()}`);
+    await queueTask("file_mkdir", [joinRemotePath(currentPath, name.trim(), platform)], `Create ${name.trim()}`);
   }
 
   const Wrapper = embedded ? "div" : "section";
@@ -231,7 +231,7 @@ export function FileBrowser({ agentId, platform, tasks, responses, loading, queu
           {menu.entry.is_dir ? (
             <button type="button" onClick={() => list(menu.entry.path)}>Open</button>
           ) : (
-            <button type="button" onClick={() => queueTask("__nagomio_file_download", [menu.entry.path], `Download ${menu.entry.name}`)}>
+            <button type="button" onClick={() => queueTask("file_download", [menu.entry.path], `Download ${menu.entry.name}`)}>
               <FaDownload size={12} /> Download
             </button>
           )}

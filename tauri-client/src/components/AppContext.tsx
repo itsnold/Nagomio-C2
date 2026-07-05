@@ -69,6 +69,18 @@ export type PayloadArtifact = {
   ua_randomize?: boolean;
   sleep_obfuscate?: boolean;
   encrypt_payload?: boolean;
+  wire_encryption?: boolean;
+  profile?: string;
+  sni_override?: string | null;
+};
+
+export type AuditEntry = {
+  id: number;
+  timestamp_unix: number;
+  source_ip: string;
+  action: string;
+  agent_id: string | null;
+  task_id: string | null;
 };
 
 export type OperationsStats = {
@@ -106,6 +118,7 @@ interface AppState {
   setLoading: (val: boolean) => void;
   refresh: () => Promise<void>;
   api: <T>(path: string, init?: RequestInit) => Promise<T>;
+  apiBlob: (path: string) => Promise<Blob>;
 }
 
 const AppContext = createContext<AppState | undefined>(undefined);
@@ -149,6 +162,15 @@ export function AppProvider({ children }: { children: ReactNode }) {
       return undefined as T;
     }
     return response.json() as Promise<T>;
+  }
+
+  async function apiBlob(path: string): Promise<Blob> {
+    const response = await fetch(`${baseUrl}${path}`, { headers });
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(text || `${response.status} ${response.statusText}`);
+    }
+    return response.blob();
   }
 
   function notify(notification: Omit<AppNotification, "id" | "createdAt">) {
@@ -235,7 +257,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   }), [agents, tasks]);
 
   return (
-    <AppContext.Provider value={{ baseUrl, setBaseUrl, apiToken, setApiToken, agents, tasks, responses, payloads, setPayloads, message, setMessage: pushMessage, connectionState, connectionError, lastSyncAt, latencyMs, stats, notifications, notify, dismissNotification, loading, setLoading, refresh, api }}>
+    <AppContext.Provider value={{ baseUrl, setBaseUrl, apiToken, setApiToken, agents, tasks, responses, payloads, setPayloads, message, setMessage: pushMessage, connectionState, connectionError, lastSyncAt, latencyMs, stats, notifications, notify, dismissNotification, loading, setLoading, refresh, api, apiBlob }}>
       {children}
     </AppContext.Provider>
   );

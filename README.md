@@ -19,9 +19,9 @@ And yeah obviously it was hard. Cross-compiling across operating systems alone t
 
 I tried to keep things modular so future-me doesn't hate present-me:
 
-- **`teamserver/`**: the backend API. Rust + `tokio` + `axum`. This is what the operator talks to, what tracks agents, and what builds payloads. Uses SQLite so there's no separate database server to worry about.
-- **`tauri-client/`**: the operator UI. React 18 + TypeScript, wrapped in Tauri v2. Way lighter than an Electron app, which I appreciate.
-- **`agent/`**: the actual implant. Written in C++17 using `cpp-httplib`. It beacons home, grabs tasks as JSON, runs them, and sends the output back. Cross-compiles to Linux and Windows (via MinGW).
+- **`teamserver/`**: the backend API. Rust + `tokio` + `axum`. This is what the operator talks to, what tracks agents, and what builds payloads. Uses SQLite in WAL mode with an append-only persistence worker, plus a SOCKS5 relay and an audit log.
+- **`tauri-client/`**: the operator UI. React 18 + TypeScript, wrapped in Tauri v2. Lists the modules, lets you pick a callback profile and SNI override at payload-build time. Way lighter than an Electron app, which I appreciate.
+- **`agent/`**: the actual implant. Written in C++17 using `cpp-httplib`. Profile-driven transport, ChaCha20-Poly1305 wire envelope, post-exploit module registry. Cross-compiles to Linux and Windows (via MinGW).
 - **`shared/`**: a tiny Rust crate that just defines the API types with `serde`, so the frontend and backend never disagree about what the JSON looks like.
 - **`scripts/`**: bash scripts I use for local testing and building so I stop typing the same commands.
 
@@ -30,6 +30,17 @@ I tried to keep things modular so future-me doesn't hate present-me:
 ## What the agent can do
 
 It's meant to be lightweight but still useful. It talks over HTTP/HTTPS, pulls down JSON tasks, and returns whatever the task printed.
+
+### Transport & opsec
+
+- **HMAC auth** - every request carries `x-nagomio-ts` + `x-nagomio-nonce` + `x-nagomio-mac` over the agent_id with a per-direction PSK. Replay cache, constant-time compare, 60s clock skew window.
+- **Wire encryption** - when enabled, `/beacon` and `/response` bodies are sealed with ChaCha20-Poly1305 keyed off the PSK via HKDF-SHA256.
+- **Pluggable callback profiles** - `default`, `cdn_metrics`, `analytics`, `dead_drop`. Each rewrites path, User-Agent, and body template to blend in.
+- **SNI override** - Windows only via `WinHttpSetOption`, for domain-front style deployments.
+- **Long-poll beacons** - teamserver holds the beacon open until a task is queued, no busy-polling.
+- **AMSI / ETW patching** - behind `NAGOMIO_STEALTH` on Windows. Patches `AmsiScanBuffer` and `EtwEventWrite` at startup.
+- **Dead-drop tasking** - the `dead_drop` profile makes the agent `GET` instead of `POST`, so it works behind pull-only CDN URLs.
+- **SOCKS5 pivot** - the teamserver starts a SOCKS5 listener and forwards bytes through the agent's `socks` module. `proxychains` into the target network.
 
 ### Evasions (optional, build-time)
 
@@ -40,10 +51,33 @@ I wanted to understand how AV/EDR tools actually look at software, so I added so
 - **Anti-Sandbox**: checks system uptime, since sandboxes usually spin up and die fast.
 - **Daemonize**: drops to the background with `FreeConsole()` (Windows) or `daemon()` (Linux).
 - **XOR config**: replaces the plaintext callback URL/token with compile-time XOR so a basic `strings` doesn't immediately give you the server.
+- **Randomize UA** - picks one of a set of common User-Agents at startup.
+- **Sleep obfuscation** - slices the sleep into jittered sub-second windows instead of a single `sleep()`.
+- **Kill date** - Unix epoch after which the agent self-deletes. Build-time validated.
 
-### Commands
+### Post-exploit modules
 
-The current code handles the shell execution and file-task paths that the UI uses. The full command list lives in [docs/commands.md](docs/commands.md) (`shell`, `powershell`, `sysinfo`, `ps`, `net`, plus file stuff like `ls`, `cat`, `download`, `upload`, `rm`, `mv`, `mkdir`).
+See [docs/commands.md](docs/commands.md) for full usage.
+
+| Module | What it does |
+|--------|---------------|
+| `whoami` | username, groups, integrity, elevation as JSON |
+| `mem_exec` | `VirtualAlloc` / `mmap` + `CreateThread` shellcode runner |
+| `portscan` | TCP connect scan with a port list / range |
+| `persist` | `registry` / `schtasks` (Win) or `crontab` / `systemd-user` / `shell-profile` (Linux) |
+| `uninstall` | self-delete now or on next reboot |
+| `inject` | `CreateRemoteThread` (Win) into a target PID |
+| `screenshot` | primary display as base64 BMP (Win) |
+| `clipboard` | current clipboard text (Win) |
+| `keylog` | `WH_KEYBOARD_LL` hook (Win) with start / flush |
+| `lsass` | `MiniDumpWriteDump` of lsass.exe (Win) |
+| `socks` | SOCKS5 byte pump for the teamserver's relay |
+
+### Shell-style commands
+
+- `shell <command line>` - `sh -lc` on Linux, `powershell.exe -NoProfile -ExecutionPolicy Bypass -Command` on Windows.
+- File ops: `file_list`, `file_download`, `file_upload`, `file_delete`, `file_rename`, `file_mkdir`.
+- Console aliases in the UI: `ls`, `cat`, `download`, `upload`, `rm`, `mv`, `mkdir`, `ps`, `kill`, `net`, `sysinfo`.
 
 ---
 
@@ -61,27 +95,43 @@ There's also a shellcode option: pick "Shellcode (.bin)" as the output format an
 
 The Tauri dashboard lets you:
 
-- See all your sessions ( on who's online, who's stale, and who's gone☹️)
-- Run tasks through an interactive console (`shell`, `powershell`, `sysinfo`, `ps`, `net`, and file commands).
+- See all your sessions (🟢 on who's online, who's stale, and who's gone☹️)
+- Run tasks through an interactive console - the new modules show up as structured command templates, plus the classic `shell`, `powershell`, `sysinfo`, `ps`, `net` commands.
 - Browse the remote filesystem (`ls`, `cat`, `download`, `upload`, `rm`, `mv`, `mkdir`).
-- Build new payloads with whatever OpSec flags you want.
+- Build new payloads with whatever OpSec flags, profile, SNI override, and wire-encryption toggle you want.
 
 ---
 
 ## Running it locally
 
-Two steps:
+```bash
+# 1. start the teamserver
+NAGOMIO_DB_PATH=nagomio.db \
+NAGOMIO_API_PSK=<random-32-bytes> \
+NAGOMIO_AGENT_PSK=<random-32-bytes> \
+NAGOMIO_WIRE_ENCRYPTION=1 \
+cargo run -p teamserver
 
-1. **Start the backend:**
-   ```bash
-   cargo run -p teamserver
-   ```
-2. **Start the UI:**
-   ```bash
-   cd tauri-client
-   npm install
-   npm run dev
-   ```
+# 2. build a payload
+cd agent
+cmake -S . -B build \
+  -DNAGOMIO_DEFAULT_CALLBACK_URL=https://your-ts.example \
+  -DNAGOMIO_DEFAULT_AGENT_TOKEN=<same-PSK-as-teamserver> \
+  -DNAGOMIO_WIRE_ENCRYPTION=ON \
+  -DNAGOMIO_PROFILE=cdn_metrics
+cmake --build build
+
+# 3. start the UI
+cd ../tauri-client
+npm install
+npm run dev
+```
+
+## Documentation
+
+- `docs/architecture.md` - runtime flow + storage + wire envelope
+- `docs/commands.md` - full command / module list
+- `docs/security.md` - auth scheme, environment variables, profiles
 
 ---
 

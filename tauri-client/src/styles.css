@@ -704,6 +704,50 @@ body {
   line-height: 1.45;
 }
 
+.task-output-screenshot {
+  margin-top: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.task-output-screenshot-meta {
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  color: #9aa3ad;
+}
+
+.task-output-screenshot-meta code {
+  color: #d2d8e0;
+  background: var(--bg-elev);
+  padding: 1px 4px;
+  border-radius: 3px;
+}
+
+.task-output-image {
+  display: block;
+  max-width: 100%;
+  max-height: 480px;
+  width: auto;
+  height: auto;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  background: #000;
+  cursor: zoom-in;
+}
+
+.task-output-loading,
+.task-output-error {
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  color: #9aa3ad;
+  padding: 8px 0;
+}
+
+.task-output-error {
+  color: #ff7a7a;
+}
+
 .console-command-bar {
   padding: 10px;
   border-top: 1px solid var(--border-color);

