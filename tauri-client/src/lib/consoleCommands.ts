@@ -350,6 +350,61 @@ export const consoleCommands: ConsoleCommand[] = [
     run: () => ({ type: "queue", label: "screenshot", task: { command: "screenshot", arguments: [], preview: "screenshot" } })
   },
   {
+    name: "stream",
+    usage: "stream <record|live|stop> <display|camera|mic> [duration-s] [fps] [quality]",
+    summary: "Record or live-stream display, camera, or mic. 'record' captures for N seconds (default 10). 'live' streams until 'stream stop'. E.g. stream record display 10 10 70, stream live camera 10, stream stop.",
+    run: (args) => {
+      const mode = args[0] || "record";
+      if (mode === "stop") {
+        return {
+          type: "queue", label: "stream stop",
+          task: { command: "stream_stop", arguments: [], preview: "stream stop" }
+        };
+      }
+      const sub = args[1] || "display";
+      if (mode === "live") {
+        const fps = args[2] || "10";
+        const quality = args[3] || "70";
+        if (sub === "mic") {
+          return {
+            type: "queue", label: `stream live mic`,
+            task: { command: "stream_mic", arguments: [], preview: `stream live mic` }
+          };
+        }
+        if (sub === "camera") {
+          return {
+            type: "queue", label: `stream live camera`,
+            task: { command: "stream_camera", arguments: [fps, quality], preview: `stream live camera ${fps}fps q${quality}` }
+          };
+        }
+        return {
+          type: "queue", label: `stream live display`,
+          task: { command: "stream_display", arguments: [fps, quality], preview: `stream live display ${fps}fps q${quality}` }
+        };
+      }
+      // record mode (default)
+      const dur = args[2] || "10";
+      const fps = args[3] || "10";
+      const quality = args[4] || "70";
+      if (sub === "mic") {
+        return {
+          type: "queue", label: `record mic`,
+          task: { command: "record_mic", arguments: [dur], preview: `record mic ${dur}s` }
+        };
+      }
+      if (sub === "camera") {
+        return {
+          type: "queue", label: `record camera`,
+          task: { command: "record_camera", arguments: [dur, fps, quality], preview: `record camera ${dur}s ${fps}fps q${quality}` }
+        };
+      }
+      return {
+        type: "queue", label: `record display`,
+        task: { command: "record_display", arguments: [dur, fps, quality], preview: `record display ${dur}s ${fps}fps q${quality}` }
+      };
+    }
+  },
+  {
     name: "clipboard",
     usage: "clipboard",
     summary: "Read the current Windows clipboard text (Windows only).",

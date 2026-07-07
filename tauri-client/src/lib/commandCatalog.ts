@@ -254,6 +254,129 @@ export const commandCatalog: CommandTemplate[] = [
     build: () => ({ command: "screenshot", arguments: [], preview: "screenshot" })
   },
   {
+    id: "record_display",
+    name: "Record Display",
+    group: "Discovery",
+    summary: "Record the primary display for N seconds at specified FPS. Returns MJPEG.",
+    fields: [
+      { key: "duration", label: "Duration (seconds)", defaultValue: "10", placeholder: "10" },
+      { key: "fps", label: "Frames Per Second", defaultValue: "10", placeholder: "10" },
+      { key: "quality", label: "JPEG Quality (1-100)", defaultValue: "70", placeholder: "70" }
+    ],
+    build: (values) => {
+      const dur = value(values, "duration", "10");
+      const fps = value(values, "fps", "10");
+      const quality = value(values, "quality", "70");
+      return {
+        command: "record_display",
+        arguments: [dur, fps, quality],
+        preview: `record display ${dur}s ${fps}fps q${quality}`
+      };
+    }
+  },
+  {
+    id: "record_camera",
+    name: "Record Camera",
+    group: "Discovery",
+    summary: "Record from the default webcam for N seconds at specified FPS. Returns MJPEG.",
+    fields: [
+      { key: "duration", label: "Duration (seconds)", defaultValue: "10", placeholder: "10" },
+      { key: "fps", label: "Frames Per Second", defaultValue: "10", placeholder: "10" },
+      { key: "quality", label: "JPEG Quality (1-100)", defaultValue: "70", placeholder: "70" }
+    ],
+    build: (values) => {
+      const dur = value(values, "duration", "10");
+      const fps = value(values, "fps", "10");
+      const quality = value(values, "quality", "70");
+      return {
+        command: "record_camera",
+        arguments: [dur, fps, quality],
+        preview: `record camera ${dur}s ${fps}fps q${quality}`
+      };
+    }
+  },
+  {
+    id: "record_mic",
+    name: "Record Microphone",
+    group: "Discovery",
+    summary: "Record from the default microphone for N seconds. Returns WAV audio.",
+    fields: [
+      { key: "duration", label: "Duration (seconds)", defaultValue: "10", placeholder: "10" }
+    ],
+    build: (values) => {
+      const dur = value(values, "duration", "10");
+      return {
+        command: "record_mic",
+        arguments: [dur],
+        preview: `record mic ${dur}s`
+      };
+    }
+  },
+  {
+    id: "stream_display",
+    name: "Stream Display (Live)",
+    group: "Discovery",
+    summary: "Live-stream the primary display until stopped. Send a stream_stop task to end.",
+    fields: [
+      { key: "fps", label: "Frames Per Second", defaultValue: "10", placeholder: "10" },
+      { key: "quality", label: "JPEG Quality (1-100)", defaultValue: "70", placeholder: "70" },
+    ],
+    build: (values) => {
+      const fps = value(values, "fps", "10");
+      const quality = value(values, "quality", "70");
+      return {
+        command: "stream_display",
+        arguments: [fps, quality],
+        preview: `stream display (live) ${fps}fps q${quality}`
+      };
+    }
+  },
+  {
+    id: "stream_camera",
+    name: "Stream Camera (Live)",
+    group: "Discovery",
+    summary: "Live-stream the default webcam until stopped. Send a stream_stop task to end.",
+    fields: [
+      { key: "fps", label: "Frames Per Second", defaultValue: "10", placeholder: "10" },
+      { key: "quality", label: "JPEG Quality (1-100)", defaultValue: "70", placeholder: "70" },
+    ],
+    build: (values) => {
+      const fps = value(values, "fps", "10");
+      const quality = value(values, "quality", "70");
+      return {
+        command: "stream_camera",
+        arguments: [fps, quality],
+        preview: `stream camera (live) ${fps}fps q${quality}`
+      };
+    }
+  },
+  {
+    id: "stream_mic",
+    name: "Stream Microphone (Live)",
+    group: "Discovery",
+    summary: "Live-stream the default microphone until stopped. Send a stream_stop task to end.",
+    fields: [],
+    build: () => {
+      return {
+        command: "stream_mic",
+        arguments: [],
+        preview: `stream mic (live)`
+      };
+    }
+  },
+  {
+    id: "stream_stop",
+    name: "Stop Live Stream",
+    group: "Discovery",
+    summary: "Stop an active live stream (display, camera, or mic).",
+    fields: [],
+    build: () => ({
+      command: "stream_stop",
+      arguments: [],
+      preview: "stream stop"
+    })
+  },
+  {
     id: "clipboard",
     name: "Clipboard",
     group: "Discovery",

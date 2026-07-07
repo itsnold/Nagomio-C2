@@ -22,6 +22,11 @@
 4. The UI polls the API and renders agents, tasks, responses, and payload
    artifacts. Operator requests are authenticated with the same HMAC scheme
    or a legacy `x-nagomio-token` header.
+5. Record and live-stream modules upload binary chunks to
+   `/api/upload/stream/<agent_id>/<task_id>`. Live UI windows poll
+   `/api/stream/<agent_id>/<task_id>` for the latest frame or audio buffer.
+   When the task completes or `stream_stop` is acknowledged, the teamserver
+   assembles an MJPEG or WAV artifact under `downloads/<agent>/<task>/`.
 
 ## Persistence
 
@@ -50,9 +55,19 @@
 output that goes into `AgentResponse.output`. See `docs/commands.md` for
 the full list.
 
+Display/camera recording and streaming share the `stream_common.h` capture and
+chunk upload path. Video artifacts use a small `MJPF` container made of a header
+plus JPEG frames; microphone artifacts are assembled into WAV files.
+
 ## Size limits
 
 - Agent command output is capped at 1 MiB per task.
 - File upload/download tasks are capped at 10 MiB per file.
 - Agent shell tasks time out after 120 seconds by default. Override with
   `NAGOMIO_TASK_TIMEOUT_SECONDS`.
+
+## Generated local data
+
+- Payload build outputs live under `payloads/` and are ignored by git.
+- Downloaded files and media artifacts live under `downloads/` and are ignored by git.
+- Local SQLite files and WAL/SHM sidecars are ignored by git.

