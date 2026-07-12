@@ -1,23 +1,30 @@
 //! Replay-resistant HMAC authentication for both agents and operators.
 //!
-//! Replaces the static `x-nagomio-agent-token` / `x-nagomio-token` header with
-//! a per-request HMAC-SHA256 over `(principal + timestamp + nonce)` keyed by a
-//! shared PSK. The nonce is supplied by the client in `x-nagomio-nonce` and
-//! lets the client generate many HMACs within the same second (e.g. a beacon
-//! and its response). Replays are rejected via a per-principal LRU of
-//! recently-seen `(timestamp, mac)` pairs and a 60-second clock skew window.
+//! Per-request HMAC-SHA256 over a canonical request string keyed by a shared
+//! PSK. The signed material binds method, path, query, principal, timestamp,
+//! nonce, and a SHA-256 of the body so headers cannot be moved across routes
+//! and bodies cannot be swapped without invalidating the MAC.
+//!
+//! Canonical message (v1):
+//! ```text
+//! v1\n{METHOD}\n{PATH}\n{QUERY}\n{PRINCIPAL}\n{TS}\n{NONCE}\n{BODY_SHA256_HEX}
+//! ```
 
 use axum::http::{HeaderMap, StatusCode};
+use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-
-use crate::SharedState;
 
 /// Allowed clock skew (in seconds) for the HMAC timestamp.
 pub const HMAC_WINDOW_SECONDS: i64 = 60;
 /// Maximum entries kept per principal for replay detection.
 const REPLAY_LRU_CAP: usize = 64;
+/// Maximum number of distinct principals tracked in the replay cache.
+const REPLAY_PRINCIPAL_CAP: usize = 4096;
+/// Drop replay entries older than this many seconds past the HMAC window.
+const REPLAY_TTL_SECONDS: i64 = HMAC_WINDOW_SECONDS * 2;
+
 /// Headers
 pub const HDR_TS: &str = "x-nagomio-ts";
 pub const HDR_MAC: &str = "x-nagomio-mac";
@@ -41,6 +48,22 @@ pub struct AuthState {
 /// suitable for axum's error response.
 pub type AuthResult = Result<(), (StatusCode, String)>;
 
+/// Build the canonical HMAC message for a request.
+pub fn canonical_message(
+    method: &str,
+    path: &str,
+    query: &str,
+    principal: &str,
+    ts: &str,
+    nonce: &str,
+    body: &[u8],
+) -> String {
+    let body_hash = hex::encode(Sha256::digest(body));
+    format!(
+        "v1\n{method}\n{path}\n{query}\n{principal}\n{ts}\n{nonce}\n{body_hash}"
+    )
+}
+
 /// Verify an operator request. The principal in the HMAC payload is the
 /// literal string `"operator"`. Falls back to the legacy
 /// `x-nagomio-token` / `Authorization: Bearer` header when no PSK is
@@ -52,6 +75,19 @@ pub async fn require_api_auth(
     state: &crate::SharedState,
     auth: &AuthState,
 ) -> AuthResult {
+    require_api_auth_ex(headers, state, auth, "GET", "/api", "", &[]).await
+}
+
+/// Operator auth with request binding (method/path/query/body).
+pub async fn require_api_auth_ex(
+    headers: &HeaderMap,
+    state: &crate::SharedState,
+    auth: &AuthState,
+    method: &str,
+    path: &str,
+    query: &str,
+    body: &[u8],
+) -> AuthResult {
     let (psk, allow_unauth) = {
         let s = state.lock().await;
         (
@@ -61,21 +97,22 @@ pub async fn require_api_auth(
     };
 
     if let Some(psk) = psk {
-        // Try the legacy header first (cheaper, broader compatibility).
-        if let Some(expected) = Some(psk.as_str()) {
-            let bearer = headers
-                .get(axum::http::header::AUTHORIZATION)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.strip_prefix("Bearer "));
-            let legacy = headers
-                .get(HDR_LEGACY_OPERATOR)
-                .and_then(|v| v.to_str().ok());
-            if bearer == Some(expected) || legacy == Some(expected) {
-                return Ok(());
-            }
+        // Legacy static token remains accepted for the operator UI, but uses
+        // constant-time comparison so timing does not leak the secret.
+        let bearer = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "));
+        let legacy = headers
+            .get(HDR_LEGACY_OPERATOR)
+            .and_then(|v| v.to_str().ok());
+        if bearer.is_some_and(|b| constant_time_eq(b.as_bytes(), psk.as_bytes()))
+            || legacy.is_some_and(|t| constant_time_eq(t.as_bytes(), psk.as_bytes()))
+        {
+            return Ok(());
         }
-        // Try HMAC.
-        return verify_hmac(headers, auth, "operator", psk.as_bytes()).await;
+        return verify_hmac(headers, auth, "operator", psk.as_bytes(), method, path, query, body)
+            .await;
     }
 
     if allow_unauth {
@@ -88,15 +125,29 @@ pub async fn require_api_auth(
     ))
 }
 
-/// Verify an agent request. The principal is the agent_id from the body, which
-/// the caller is expected to pass in via the `principal` argument (since agent
-/// auth must happen *before* parsing the body for an unauthenticated server,
-/// we verify against the agent_id header the agent always sends).
+/// Verify an agent request. Identity is taken from the already-authenticated
+/// principal argument (agent_id), not re-read from an untrusted field after
+/// verification.
 pub async fn require_agent_auth(
     headers: &HeaderMap,
     state: &crate::SharedState,
     auth: &AuthState,
     principal: &str,
+) -> AuthResult {
+    // Legacy entry point: no request binding (tests / gradual migration).
+    require_agent_auth_ex(headers, state, auth, principal, "POST", "/", "", &[]).await
+}
+
+/// Agent auth with full request binding.
+pub async fn require_agent_auth_ex(
+    headers: &HeaderMap,
+    state: &crate::SharedState,
+    auth: &AuthState,
+    principal: &str,
+    method: &str,
+    path: &str,
+    query: &str,
+    body: &[u8],
 ) -> AuthResult {
     let (psk, allow_unauth) = {
         let s = state.lock().await;
@@ -107,7 +158,17 @@ pub async fn require_agent_auth(
     };
 
     if let Some(psk) = psk {
-        return verify_hmac(headers, auth, principal, psk.as_bytes()).await;
+        return verify_hmac(
+            headers,
+            auth,
+            principal,
+            psk.as_bytes(),
+            method,
+            path,
+            query,
+            body,
+        )
+        .await;
     }
 
     if allow_unauth {
@@ -125,6 +186,10 @@ async fn verify_hmac(
     auth: &AuthState,
     principal: &str,
     psk: &[u8],
+    method: &str,
+    path: &str,
+    query: &str,
+    body: &[u8],
 ) -> AuthResult {
     let ts = headers
         .get(HDR_TS)
@@ -134,25 +199,30 @@ async fn verify_hmac(
         .get(HDR_MAC)
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| (StatusCode::UNAUTHORIZED, "missing mac header".into()))?;
+    let nonce = headers
+        .get(HDR_NONCE)
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, "missing nonce header".into()))?;
+
+    if nonce.is_empty() {
+        return Err((StatusCode::UNAUTHORIZED, "empty nonce".into()));
+    }
+    // Require a cryptographically useful nonce (at least 8 hex chars / 32 bits).
+    if nonce.len() < 8 {
+        return Err((StatusCode::UNAUTHORIZED, "nonce too short".into()));
+    }
 
     let ts_i: i64 = ts
         .parse()
         .map_err(|_| (StatusCode::UNAUTHORIZED, "invalid timestamp".into()))?;
     let now = unix_now();
-    if (now - ts_i).abs() > HMAC_WINDOW_SECONDS {
+    // Checked distance avoids overflow on extreme timestamps.
+    let skew = now.abs_diff(ts_i) as i64;
+    if skew > HMAC_WINDOW_SECONDS {
         return Err((StatusCode::UNAUTHORIZED, "timestamp out of window".into()));
     }
 
-    // Recompute HMAC. The signed message is `principal + "\n" + ts + "\n" + nonce`
-    // where the nonce is supplied by the client. A client may call us
-    // multiple times in the same second; the nonce keeps every call's MAC
-    // unique. The teamserver tracks (ts, mac) pairs in a per-principal LRU
-    // to reject replayed packets.
-    let nonce = headers
-        .get(HDR_NONCE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let msg = format!("{principal}\n{ts}\n{nonce}");
+    let msg = canonical_message(method, path, query, principal, ts, nonce, body);
     let expected = hmac_sha256(psk, msg.as_bytes());
     let expected_hex = hex::encode(expected);
 
@@ -161,22 +231,49 @@ async fn verify_hmac(
     }
 
     // Replay: check (ts, mac) has not been seen for this principal.
-    let key = format!("{principal}\x00{ts}\x00{mac}");
     let mut cache = auth.replay.lock().await;
-    let bucket = cache
-        .seen
-        .entry(principal.to_owned())
-        .or_default();
+    // Bound the number of principals tracked.
+    if !cache.seen.contains_key(principal) && cache.seen.len() >= REPLAY_PRINCIPAL_CAP {
+        // Evict the first principal with an empty or fully-stale bucket.
+        let stale_keys: Vec<String> = cache
+            .seen
+            .iter()
+            .filter(|(_, bucket)| {
+                bucket.is_empty()
+                    || bucket
+                        .iter()
+                        .all(|(t, _)| now.abs_diff(*t) as i64 > REPLAY_TTL_SECONDS)
+            })
+            .map(|(k, _)| k.clone())
+            .take(16)
+            .collect();
+        for k in stale_keys {
+            cache.seen.remove(&k);
+        }
+        if cache.seen.len() >= REPLAY_PRINCIPAL_CAP {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "replay cache capacity exceeded".into(),
+            ));
+        }
+    }
+
+    let bucket = cache.seen.entry(principal.to_owned()).or_default();
+    // Time-based eviction before capacity trim.
+    while let Some(&(t, _)) = bucket.front() {
+        if now.abs_diff(t) as i64 > REPLAY_TTL_SECONDS {
+            bucket.pop_front();
+        } else {
+            break;
+        }
+    }
     if bucket.iter().any(|(t, m)| *t == ts_i && m == mac) {
         return Err((StatusCode::UNAUTHORIZED, "replay detected".into()));
     }
     bucket.push_back((ts_i, mac.to_owned()));
-    if bucket.len() > REPLAY_LRU_CAP {
+    while bucket.len() > REPLAY_LRU_CAP {
         bucket.pop_front();
     }
-    drop(cache);
-    // Touch the unused variable so the compiler keeps `key` around for editors.
-    let _ = &key;
 
     Ok(())
 }
@@ -184,11 +281,12 @@ async fn verify_hmac(
 /// Constant-time compare. Wraps `subtle::ConstantTimeEq` so callers do not
 /// need to deal with `[u8]::ct_eq` returning a `Choice`.
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    let res = a.ct_eq(b);
-    bool::from(res)
+    if a.len() != b.len() {
+        return false;
+    }
+    use subtle::ConstantTimeEq;
+    bool::from(a.ct_eq(b))
 }
-
-use subtle::ConstantTimeEq;
 
 fn hmac_sha256(key: &[u8], msg: &[u8]) -> Vec<u8> {
     use hmac::{Hmac, Mac};
@@ -209,4 +307,23 @@ fn unix_now() -> i64 {
 #[doc(hidden)]
 pub fn auth_hmac_for_test(key: &[u8], msg: &[u8]) -> String {
     hex::encode(hmac_sha256(key, msg))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonical_message_binds_body() {
+        let a = canonical_message("POST", "/beacon", "", "agent-1", "1", "deadbeef", b"{}");
+        let b = canonical_message("POST", "/beacon", "", "agent-1", "1", "deadbeef", b"{ }");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn canonical_message_binds_route() {
+        let a = canonical_message("POST", "/beacon", "", "agent-1", "1", "deadbeef", b"");
+        let b = canonical_message("POST", "/response", "", "agent-1", "1", "deadbeef", b"");
+        assert_ne!(a, b);
+    }
 }

@@ -24,8 +24,9 @@
 | `NAGOMIO_DEFAULT_SLEEP_SECONDS` | `5` | Default beacon interval |
 | `NAGOMIO_API_PSK` | unset | PSK for HMAC operator auth and wire body sealing. `NAGOMIO_API_TOKEN` is a fallback. |
 | `NAGOMIO_AGENT_PSK` | unset | PSK for HMAC agent auth and wire body sealing. `NAGOMIO_AGENT_TOKEN` is a fallback. |
-| `NAGOMIO_WIRE_ENCRYPTION` | `false` | When true, `/beacon` and `/response` bodies are sealed with ChaCha20-Poly1305. |
-| `NAGOMIO_SOCKS_BIND_ADDR` | unset | If set, the teamserver starts a SOCKS5 relay at this address. |
+| `NAGOMIO_WIRE_ENCRYPTION` | `false` | When true, agent `/beacon` and `/response` bodies are sealed with ChaCha20-Poly1305. Responses are sealed only when this flag is on. |
+| `NAGOMIO_DEAD_DROP` | `false` | When true, registers unauthenticated dead-drop routes. Off by default. |
+| `NAGOMIO_SOCKS_BIND_ADDR` | unset | If set, starts an **experimental** SOCKS5 listener (not fully wired end-to-end). |
 | `NAGOMIO_CORS_ORIGINS` | Tauri dev defaults | Comma-separated allowlist |
 | `NAGOMIO_ALLOW_UNAUTHENTICATED` | loopback only | Explicit override for lab deployments |
 
@@ -35,32 +36,41 @@
 
 Every operator API call must carry:
 
-- `Authorization: Bearer <api_psk>` (legacy), **or**
+- `Authorization: Bearer <api_psk>` (legacy static token; still accepted when PSK is set), **or**
 - `x-nagomio-token: <api_psk>` (legacy), **or**
-- `x-nagomio-ts: <unix-seconds>` + `x-nagomio-nonce: <random>` +
-  `x-nagomio-mac: hex(HMAC-SHA256(api_psk, "operator\n<ts>\n<nonce>"))`
+- HMAC headers over the canonical request (see below)
 
-The MAC is verified with `subtle::ConstantTimeEq` to avoid timing side-channels
-on token guess. Each `(timestamp, mac)` pair is held in a per-principal LRU
-rejected on reuse within the 60s clock skew window.
+Static tokens are compared constant-time. HMAC uses a replay cache with time-based
+eviction and a per-principal capacity limit.
 
 ### Agent (A4)
 
-Every `/beacon` and `/response` POST must carry:
+Every authenticated agent request must carry:
 
-- `x-nagomio-ts` + `x-nagomio-nonce` + `x-nagomio-mac` over the **agent_id** (not
-  `agent`). The same constant-time compare and replay cache apply.
+- `x-nagomio-ts` + `x-nagomio-nonce` (non-empty, ≥8 chars) + `x-nagomio-mac`
 
-The principal in the HMAC is the agent_id from the body. The token is
-`NAGOMIO_AGENT_PSK` (or the per-payload `agent_psk`).
+Canonical signed message (`v1`):
+
+```text
+v1\n{METHOD}\n{PATH}\n{QUERY}\n{PRINCIPAL}\n{TS}\n{NONCE}\n{sha256_hex(body)}
+```
+
+- `PRINCIPAL` is the `agent_id` for agents, or the literal `operator` for operators.
+- `PATH` is the request path the client actually posts to (e.g. `/beacon`, `/response`,
+  `/api/upload/stream/<agent>/<task>`).
+- Body hash is SHA-256 of the **raw HTTP body** (including wire envelopes when enabled).
+
+The shared agent PSK still authenticates all agents; task/stream ownership is also
+checked server-side so one agent cannot complete another's tasks.
 
 ## Wire encryption (B1)
 
 When `NAGOMIO_WIRE_ENCRYPTION=1` on the teamserver, `/beacon` and `/response`
 HTTP bodies are sealed using ChaCha20-Poly1305 with a key derived from the
 PSK via HKDF-SHA256. The directional context strings are
-`nagomio/agent/v1` and `nagomio/server/v1` so the two directions use
-independent keys.
+`nagomio/agent/v1` (agent → server) and `nagomio/server/v1` (server → agent).
+The server requires the expected direction on open. When wire encryption is
+**off**, replies stay plaintext even if a PSK is configured.
 
 The wire envelope is a single JSON object:
 
@@ -88,8 +98,9 @@ The agent's on-the-wire shape is configured at build time via
   as `{"events":[{<beacon>}]}`.
 - `dead_drop` — `GET /dead_drop/<agent_id>`, `POST /response`. UA unchanged.
 
-The teamserver listens on all of `/beacon`, `/api/v2/metrics`, `/track`,
-`/metrics/v1/events`, and `/dead_drop/:agent_id`.
+The teamserver listens on `/beacon`, `/api/v2/metrics`, `/track`, and
+`/metrics/v1/events`. Dead-drop routes are registered only when
+`NAGOMIO_DEAD_DROP=true`.
 
 ## SNI override (B4)
 
@@ -126,13 +137,13 @@ Every authenticated operator API call emits a row into `audit_log`:
 
 ## SOCKS5 relay (B9)
 
-If `NAGOMIO_SOCKS_BIND_ADDR` is set, the teamserver starts a SOCKS5 listener
-on that address. `proxychains curl http://internal-target` pointed at the
-listener pushes bytes through the teamserver into the agent's
-`socks` module. Used for pivoting into a target's internal network.
+**Experimental / incomplete.** If `NAGOMIO_SOCKS_BIND_ADDR` is set, the
+teamserver starts a SOCKS5 listener, but the agent return path and outbound
+queue are not fully wired. Do not treat SOCKS as supported.
 
 ## Dead-drop tasking (B11)
 
+**Disabled by default.** Set `NAGOMIO_DEAD_DROP=true` to register routes.
 The `dead_drop` profile makes the agent `GET /dead_drop/<agent_id>` instead
 of `POST /beacon`. Operators can push tasks via
 `POST /api/dead_drop/<agent_id>/push` to the teamserver. Useful when the

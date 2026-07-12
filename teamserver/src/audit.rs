@@ -4,7 +4,7 @@
 //! persistence worker. The `audit_log` SQLite table is queried by the
 //! read endpoint `/api/audit` for display in the operator UI.
 
-use crate::auth::{require_api_auth, AuthState};
+use crate::auth::require_api_auth;
 use crate::persistence::{open_db, PersistEvent};
 use crate::{internal_error, ApiState};
 use axum::extract::{Query, State};
@@ -18,17 +18,6 @@ use tokio::sync::mpsc;
 #[derive(Clone)]
 pub struct AuditState {
     pub tx: mpsc::UnboundedSender<PersistEvent>,
-    pub auth: AuthState,
-}
-
-impl AuditState {
-    /// Convenience constructor for the read endpoint.
-    pub fn from(api: &ApiState) -> Self {
-        AuditState {
-            tx: api.audit.tx.clone(),
-            auth: api.auth.clone(),
-        }
-    }
 }
 
 /// Record an operator action. Caller passes the empty string for `source_ip`

@@ -14,16 +14,10 @@
 //! preserved via a debounced periodic checkpoint emitted by the same worker.
 
 use rusqlite::{params, Connection};
-use shared::{
-    AgentRecord, AgentResponse, AgentStatus, AgentSummary, PayloadArtifact, Task, TaskRecord,
-    TaskStatus,
-};
-use std::collections::{HashMap, VecDeque};
+use shared::AgentResponse;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 
-use crate::AppState;
 use crate::SharedState;
 use crate::Store;
 
@@ -85,26 +79,16 @@ pub enum PersistEvent {
     Checkpoint,
 }
 
-/// Spawns the persistence worker. Replaces the sender in `AppState` with a
-/// fresh channel so handlers push to a queue that the worker drains.
+/// Spawns the persistence worker that drains `rx`. The caller must create a
+/// single channel and share its sender with `AppState`, `AuditState`, and the
+/// requeue worker so every event reaches this same receiver.
 pub fn spawn(
     state: SharedState,
     db_path: Option<PathBuf>,
     state_file: Option<PathBuf>,
+    mut rx: mpsc::UnboundedReceiver<PersistEvent>,
 ) {
-    // The caller already created a sender and stored it in `AppState`.
-    // We create our own channel here and overwrite the in-memory sender
-    // so handlers push to *our* channel.
-    let (real_tx, mut rx) = mpsc::unbounded_channel::<PersistEvent>();
-    let state_for_swap = state;
-
     tokio::spawn(async move {
-        // Overwrite the sender in AppState so handlers use this one.
-        {
-            let mut s = state_for_swap.lock().await;
-            s.persist_tx = real_tx.clone();
-        }
-
         // Open a private SQLite connection for the worker. If no db_path is
         // configured (legacy JSON-only mode) the worker keeps running but only
         // performs the debounced checkpoint writes.
@@ -134,7 +118,7 @@ pub fn spawn(
                 last_checkpoint = std::time::Instant::now();
                 if let Some(path) = state_file.as_ref() {
                     let snapshot = {
-                        let s = state_for_swap.lock().await;
+                        let s = state.lock().await;
                         s.store.clone()
                     };
                     save_store_json(&path.clone(), &snapshot).await;
@@ -145,7 +129,7 @@ pub fn spawn(
                 last_checkpoint = std::time::Instant::now();
                 if let Some(path) = state_file.as_ref() {
                     let snapshot = {
-                        let s = state_for_swap.lock().await;
+                        let s = state.lock().await;
                         s.store.clone()
                     };
                     save_store_json(&path.clone(), &snapshot).await;
@@ -264,6 +248,11 @@ fn apply_event(conn: &Connection, event: &PersistEvent) -> Result<(), String> {
             conn.execute(
                 "UPDATE tasks SET status = ?2, completed_at_unix = ?3 WHERE task_id = ?1",
                 params![task_id, status, *completed_at_unix as i64],
+            ).map_err(|e| e.to_string())?;
+            // A late response or terminal transition must not leave a pending row.
+            conn.execute(
+                "DELETE FROM pending_tasks WHERE task_id = ?1",
+                params![task_id],
             ).map_err(|e| e.to_string())?;
         }
         PersistEvent::TaskReQueued { task_id } => {

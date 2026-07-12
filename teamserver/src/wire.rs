@@ -62,10 +62,28 @@ pub fn seal(psk: &[u8], ctx: &str, plaintext: &[u8]) -> Result<String, String> {
     serde_json::to_string(&envelope).map_err(|e| format!("serialize envelope: {e}"))
 }
 
-/// Open a sealed envelope. `ctx` must match the context the sealer used.
+/// Open a sealed envelope. When `expected_ctx` is `Some`, the envelope's
+/// claimed context must match exactly (prevents direction-context swaps).
 pub fn open(psk: &[u8], envelope: &WireEnvelope) -> Result<Vec<u8>, String> {
+    open_with_ctx(psk, envelope, None)
+}
+
+/// Open a sealed envelope requiring a specific directional context.
+pub fn open_with_ctx(
+    psk: &[u8],
+    envelope: &WireEnvelope,
+    expected_ctx: Option<&str>,
+) -> Result<Vec<u8>, String> {
     if envelope.ctx.is_empty() {
         return Err("envelope is missing ctx".into());
+    }
+    if let Some(expected) = expected_ctx {
+        if envelope.ctx != expected {
+            return Err(format!(
+                "unexpected wire context: got {:?}, expected {:?}",
+                envelope.ctx, expected
+            ));
+        }
     }
     let key = derive_key(psk, &envelope.ctx);
     let cipher = ChaCha20Poly1305::new(&key.into());

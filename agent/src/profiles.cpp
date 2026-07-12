@@ -28,7 +28,9 @@ Profile cdn_metrics_profile() {
         "/metrics/v1/events",
         "CloudMetrics/1.4",
         "x-api-key",
-        R"({"batch":[{"m":"{body}"}]})",
+        // {body} is substituted as a JSON value (not a quoted string) so the
+        // result remains valid JSON when the beacon is an object.
+        R"({"batch":[{"m":{body}}]})",
         "POST",
     };
 }
