@@ -9,28 +9,39 @@
 use crate::persistence::PersistEvent;
 use crate::SharedState;
 use std::time::Duration;
-use tokio::sync::mpsc;
 
 /// How long a dispatched task can stay un-replied before it is reset.
 pub const STALE_DISPATCH_TIMEOUT_SECONDS: u64 = 600;
 
-pub fn spawn(state: SharedState, tx: mpsc::UnboundedSender<PersistEvent>) {
+pub fn spawn(
+    state: SharedState,
+    tx: crate::persistence::PersistSender,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(30));
         // Skip the immediate first tick so boot isn't noisy.
         interval.tick().await;
         loop {
-            interval.tick().await;
-            if let Err(err) = tick_once(&state, &tx).await {
-                eprintln!("[-] re-queue worker: {err}");
+            tokio::select! {
+                _ = interval.tick() => {
+                    if let Err(err) = tick_once(&state, &tx).await {
+                        eprintln!("[-] re-queue worker: {err}");
+                    }
+                }
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                }
             }
         }
-    });
+    })
 }
 
 async fn tick_once(
     state: &SharedState,
-    tx: &mpsc::UnboundedSender<PersistEvent>,
+    tx: &crate::persistence::PersistSender,
 ) -> Result<(), String> {
     let now = unix_now();
     let mut requeued = Vec::new();
@@ -71,7 +82,7 @@ async fn tick_once(
         }
     }
     for task_id in requeued {
-        let _ = tx.send(PersistEvent::TaskReQueued { task_id });
+        crate::persistence::persist(tx, PersistEvent::TaskReQueued { task_id }).await?;
     }
     Ok(())
 }

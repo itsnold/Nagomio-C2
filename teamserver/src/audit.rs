@@ -13,29 +13,30 @@ use axum::Json;
 use rusqlite::params;
 use serde::Deserialize;
 use shared::AuditEntry;
-use tokio::sync::mpsc;
 
 #[derive(Clone)]
 pub struct AuditState {
-    pub tx: mpsc::UnboundedSender<PersistEvent>,
+    pub tx: crate::persistence::PersistSender,
 }
 
 /// Record an operator action. Caller passes the empty string for `source_ip`
 /// when the requestor's IP cannot be determined.
-pub fn record(
-    tx: &mpsc::UnboundedSender<PersistEvent>,
+pub async fn record(
+    tx: &crate::persistence::PersistSender,
     source_ip: &str,
     action: &str,
     agent_id: Option<&str>,
     task_id: Option<&str>,
-) {
-    let _ = tx.send(PersistEvent::Audit {
+) -> Result<(), (StatusCode, String)> {
+    crate::persistence::persist(tx, PersistEvent::Audit {
         timestamp_unix: unix_now(),
         source_ip: source_ip.to_owned(),
         action: action.to_owned(),
         agent_id: agent_id.map(|s| s.to_owned()),
         task_id: task_id.map(|s| s.to_owned()),
-    });
+    })
+    .await
+    .map_err(|err| (StatusCode::SERVICE_UNAVAILABLE, format!("persistence failed: {err}")))
 }
 
 #[derive(Deserialize, Default)]
@@ -50,7 +51,7 @@ pub async fn api_get_audit(
     Query(query): Query<AuditQuery>,
 ) -> Result<Json<Vec<AuditEntry>>, (StatusCode, String)> {
     require_api_auth(&headers, &api.shared, &api.auth).await?;
-    record(&api.audit.tx, "", "list_audit", None, None);
+    record(&api.audit.tx, "", "list_audit", None, None).await?;
     let limit = query.limit.unwrap_or(200).min(1000);
     let since = query.since.unwrap_or(0) as i64;
     let db_path = {

