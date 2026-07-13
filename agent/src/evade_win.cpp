@@ -16,6 +16,7 @@
 
 #include <windows.h>
 #include <psapi.h>
+#include <cstring>
 
 namespace nagomio_evade {
 
