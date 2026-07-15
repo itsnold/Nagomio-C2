@@ -151,10 +151,8 @@ pub async fn require_agent_auth_ex(
 ) -> AuthResult {
     let (psk, allow_unauth) = {
         let s = state.lock().await;
-        (
-            s.config.agent_psk.clone(),
-            s.config.allow_unauthenticated,
-        )
+        let resolved = crate::resolve_agent_psk(&s.store, principal, s.config.agent_psk.as_deref());
+        (resolved, s.config.allow_unauthenticated)
     };
 
     if let Some(psk) = psk {

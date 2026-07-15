@@ -60,6 +60,10 @@ pub enum PersistEvent {
     AgentRemoved {
         agent_id: String,
     },
+    AgentPskSet {
+        agent_id: String,
+        psk: String,
+    },
     PayloadUpserted {
         build_id: String,
         artifact_json: String,
@@ -201,6 +205,10 @@ fn open_db_with_wal(path: &Path) -> rusqlite::Result<Connection> {
             first_seen_unix INTEGER NOT NULL,
             last_seen_unix INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS agent_psks (
+            agent_id TEXT PRIMARY KEY,
+            psk TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS tasks (
             task_id TEXT PRIMARY KEY,
             agent_id TEXT NOT NULL,
@@ -337,6 +345,13 @@ fn apply_event(conn: &mut Connection, event: &PersistEvent) -> Result<(), String
             conn.execute("DELETE FROM responses WHERE agent_id = ?1", params![agent_id]).map_err(|e| e.to_string())?;
             conn.execute("DELETE FROM tasks WHERE agent_id = ?1", params![agent_id]).map_err(|e| e.to_string())?;
             conn.execute("DELETE FROM agents WHERE agent_id = ?1", params![agent_id]).map_err(|e| e.to_string())?;
+            conn.execute("DELETE FROM agent_psks WHERE agent_id = ?1", params![agent_id]).map_err(|e| e.to_string())?;
+        }
+        PersistEvent::AgentPskSet { agent_id, psk } => {
+            conn.execute(
+                "INSERT INTO agent_psks (agent_id, psk) VALUES (?1, ?2) ON CONFLICT(agent_id) DO UPDATE SET psk = excluded.psk",
+                params![agent_id, psk],
+            ).map_err(|e| e.to_string())?;
         }
         PersistEvent::PayloadUpserted { build_id, artifact_json } => {
             conn.execute(

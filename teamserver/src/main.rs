@@ -84,6 +84,12 @@ struct StreamBuffer {
 struct Store {
     #[serde(default)]
     agents: HashMap<String, AgentRecord>,
+    /// Per-agent HMAC/wire PSKs. When an agent has an entry here, only this
+    /// credential is accepted for that agent's requests; the shared
+    /// `config.agent_psk` is ignored for it (see `resolve_agent_psk`). This
+    /// prevents one agent's credential from authenticating as another.
+    #[serde(default)]
+    agent_psks: HashMap<String, String>,
     #[serde(default)]
     tasks: HashMap<String, TaskRecord>,
     #[serde(default)]
@@ -247,6 +253,10 @@ async fn main() {
         .route(
             "/api/agents/:agent_id",
             get(api_get_agent).delete(api_delete_agent),
+        )
+        .route(
+            "/api/agents/:agent_id/credential",
+            post(api_set_agent_credential),
         )
         .route("/api/tasks", get(api_get_tasks).post(api_add_task))
         .route("/api/tasks/:task_id", get(api_get_task))
@@ -539,6 +549,10 @@ fn open_db(path: &Path) -> rusqlite::Result<Connection> {
             build_id TEXT PRIMARY KEY,
             artifact_json TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS agent_psks (
+            agent_id TEXT PRIMARY KEY,
+            psk TEXT NOT NULL
+        );
         ",
     )?;
     Ok(conn)
@@ -567,6 +581,13 @@ fn save_store_to_db(
                 agent.first_seen_unix as i64,
                 agent.last_seen_unix as i64,
             ],
+        )?;
+    }
+
+    for (agent_id, psk) in &store.agent_psks {
+        tx.execute(
+            "INSERT INTO agent_psks (agent_id, psk) VALUES (?1, ?2)",
+            params![agent_id, psk],
         )?;
     }
 
@@ -645,6 +666,15 @@ fn load_store_from_db(path: &Path) -> Result<Store, Box<dyn std::error::Error + 
     for row in agent_rows {
         let (agent_id, agent) = row?;
         store.agents.insert(agent_id, agent);
+    }
+
+    let mut agent_psks = conn.prepare("SELECT agent_id, psk FROM agent_psks")?;
+    let agent_psk_rows = agent_psks.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in agent_psk_rows {
+        let (agent_id, psk) = row?;
+        store.agent_psks.insert(agent_id, psk);
     }
 
     let mut tasks = conn.prepare(
@@ -833,6 +863,17 @@ fn next_queue_position(store: &mut Store, agent_id: &str) -> usize {
     let pos = *seq;
     *seq = seq.saturating_add(1);
     pos as usize
+}
+
+/// Resolve the PSK used to authenticate a specific agent. A per-agent
+/// credential takes precedence over the shared enrollment PSK; once an agent
+/// has its own credential, the shared PSK is no longer accepted for it, so a
+/// leaked global key cannot impersonate that agent.
+fn resolve_agent_psk(store: &Store, agent_id: &str, enrollment_psk: Option<&str>) -> Option<String> {
+    if let Some(psk) = store.agent_psks.get(agent_id) {
+        return Some(psk.clone());
+    }
+    enrollment_psk.map(|p| p.to_owned())
 }
 
 /// Validate payload build IDs used as filesystem path components.
@@ -1990,6 +2031,69 @@ async fn api_delete_agent(
             StatusCode::NOT_FOUND,
             format!("agent {} not found", agent_id),
         ));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(serde::Deserialize)]
+struct SetCredentialReq {
+    /// Raw PSK string. Must meet minimum quality (length + non-whitespace).
+    psk: String,
+}
+
+/// Provision or rotate a unique per-agent credential. Once set, only this PSK
+/// authenticates the agent; the shared enrollment PSK is no longer accepted
+/// for it. Requires operator authentication.
+async fn api_set_agent_credential(
+    State(api): State<ApiState>,
+    headers: HeaderMap,
+    AxumPath(agent_id): AxumPath<String>,
+    Json(payload): Json<SetCredentialReq>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    require_api_auth(&headers, &api.shared, &api.auth).await?;
+    audit::record(
+        &api.audit.tx,
+        "",
+        "set_agent_credential",
+        Some(&agent_id),
+        None,
+    )
+    .await?;
+
+    let psk = payload.psk.trim();
+    if psk.len() < 16 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "psk must be at least 16 characters".to_owned(),
+        ));
+    }
+    if psk.bytes().any(|b| b.is_ascii_whitespace()) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "psk must not contain whitespace".to_owned(),
+        ));
+    }
+
+    {
+        let mut s = api.shared.lock().await;
+        if !s.store.agents.contains_key(&agent_id) {
+            return Err((
+                StatusCode::NOT_FOUND,
+                format!("agent {} not found", agent_id),
+            ));
+        }
+        s.store
+            .agent_psks
+            .insert(agent_id.clone(), psk.to_owned());
+        persistence::persist(
+            &s.persist_tx,
+            PersistEvent::AgentPskSet {
+                agent_id: agent_id.clone(),
+                psk: psk.to_owned(),
+            },
+        )
+        .await
+        .map_err(|err| (StatusCode::SERVICE_UNAVAILABLE, format!("persistence failed: {err}")))?;
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -3274,5 +3378,271 @@ mod tests {
         let env: WireEnvelope = serde_json::from_str(&sealed).expect("envelope json");
         let opened = wire::open(psk, &env).expect("open");
         assert_eq!(opened, plain);
+    }
+
+    fn signed_agent_headers(
+        psk: &str,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        principal: &str,
+    ) -> HeaderMap {
+        let ts = unix_now().to_string();
+        let nonce = "deadbeef";
+        let msg = auth::canonical_message(method, path, "", principal, &ts, nonce, body);
+        let mac = auth::auth_hmac_for_test(psk.as_bytes(), msg.as_bytes());
+        let mut h = HeaderMap::new();
+        h.insert(auth::HDR_TS, ts.parse().unwrap());
+        h.insert(auth::HDR_NONCE, nonce.parse().unwrap());
+        h.insert(auth::HDR_MAC, mac.parse().unwrap());
+        h
+    }
+
+    fn operator_headers(psk: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(auth::HDR_LEGACY_OPERATOR, psk.parse().unwrap());
+        h
+    }
+
+    async fn configure_psks(api: &ApiState) {
+        let mut s = api.shared.lock().await;
+        s.config.agent_psk = Some("shared-psk-1234567890".to_owned());
+        s.config.api_psk = Some("api-psk-1234567890".to_owned());
+        s.config.allow_unauthenticated = false;
+    }
+
+    async fn provision_credential(api: &ApiState, agent_id: &str, psk: &str) {
+        let req = SetCredentialReq {
+            psk: psk.to_owned(),
+        };
+        let resp = api_set_agent_credential(
+            State(api.clone()),
+            operator_headers("api-psk-1234567890"),
+            AxumPath(agent_id.to_owned()),
+            Json(req),
+        )
+        .await;
+        assert!(resp.is_ok(), "credential provisioning should succeed");
+    }
+
+    async fn register_agent(api: &ApiState, agent_id: &str, psk: &str) {
+        let beacon = BeaconRequest {
+            registration: AgentRegistration {
+                agent_id: agent_id.to_owned(),
+                hostname: "host".to_owned(),
+                os: "linux".to_owned(),
+                architecture: "x86_64".to_owned(),
+                pid: 0,
+                integrity: String::new(),
+                is_elevated: false,
+                av_products: Vec::new(),
+            },
+        };
+        let body = serde_json::to_string(&beacon).unwrap();
+        let headers = signed_agent_headers(psk, "POST", "/beacon", body.as_bytes(), agent_id);
+        let resp = handle_beacon(
+            State(api.clone()),
+            headers,
+            "/beacon".parse().unwrap(),
+            Query(BeaconQuery::default()),
+            body,
+        )
+        .await;
+        assert!(resp.is_ok(), "agent {agent_id} registration should succeed");
+    }
+
+    #[tokio::test]
+    async fn per_agent_credential_rejects_shared_psk() {
+        let api = api_state(Store::default()).await;
+        configure_psks(&api).await;
+        register_agent(&api, "agent-1", "shared-psk-1234567890").await;
+        provision_credential(&api, "agent-1", "unique-agent1-psk-123456").await;
+
+        // The shared enrollment PSK must no longer authenticate agent-1.
+        let beacon = BeaconRequest {
+            registration: AgentRegistration {
+                agent_id: "agent-1".to_owned(),
+                hostname: "h".to_owned(),
+                os: "linux".to_owned(),
+                architecture: "x86_64".to_owned(),
+                pid: 0,
+                integrity: String::new(),
+                is_elevated: false,
+                av_products: Vec::new(),
+            },
+        };
+        let body = serde_json::to_string(&beacon).unwrap();
+        let headers = signed_agent_headers(
+            "shared-psk-1234567890",
+            "POST",
+            "/beacon",
+            body.as_bytes(),
+            "agent-1",
+        );
+        let resp = handle_beacon(
+            State(api.clone()),
+            headers,
+            "/beacon".parse().unwrap(),
+            Query(BeaconQuery::default()),
+            body,
+        )
+        .await;
+        assert!(
+            resp.is_err(),
+            "shared PSK must be rejected after a per-agent credential is set"
+        );
+
+        // The unique per-agent PSK must authenticate.
+        let beacon = BeaconRequest {
+            registration: AgentRegistration {
+                agent_id: "agent-1".to_owned(),
+                hostname: "h".to_owned(),
+                os: "linux".to_owned(),
+                architecture: "x86_64".to_owned(),
+                pid: 0,
+                integrity: String::new(),
+                is_elevated: false,
+                av_products: Vec::new(),
+            },
+        };
+        let body = serde_json::to_string(&beacon).unwrap();
+        let headers = signed_agent_headers(
+            "unique-agent1-psk-123456",
+            "POST",
+            "/beacon",
+            body.as_bytes(),
+            "agent-1",
+        );
+        let resp = handle_beacon(
+            State(api.clone()),
+            headers,
+            "/beacon".parse().unwrap(),
+            Query(BeaconQuery::default()),
+            body,
+        )
+        .await;
+        assert!(resp.is_ok(), "unique per-agent PSK must authenticate");
+    }
+
+    #[tokio::test]
+    async fn cross_agent_cannot_impersonate_with_own_psk() {
+        let api = api_state(Store::default()).await;
+        configure_psks(&api).await;
+        register_agent(&api, "agent-1", "shared-psk-1234567890").await;
+        register_agent(&api, "agent-2", "shared-psk-1234567890").await;
+        provision_credential(&api, "agent-1", "unique-agent1-psk-123456").await;
+        provision_credential(&api, "agent-2", "unique-agent2-psk-123456").await;
+
+        // agent-2 signs a beacon claiming agent-1 using agent-2's own PSK.
+        let beacon = BeaconRequest {
+            registration: AgentRegistration {
+                agent_id: "agent-1".to_owned(),
+                hostname: "h".to_owned(),
+                os: "linux".to_owned(),
+                architecture: "x86_64".to_owned(),
+                pid: 0,
+                integrity: String::new(),
+                is_elevated: false,
+                av_products: Vec::new(),
+            },
+        };
+        let body = serde_json::to_string(&beacon).unwrap();
+        let headers = signed_agent_headers(
+            "unique-agent2-psk-123456",
+            "POST",
+            "/beacon",
+            body.as_bytes(),
+            "agent-1",
+        );
+        let resp = handle_beacon(
+            State(api.clone()),
+            headers,
+            "/beacon".parse().unwrap(),
+            Query(BeaconQuery::default()),
+            body,
+        )
+        .await;
+        assert!(
+            resp.is_err(),
+            "agent-2 must not authenticate as agent-1 with its own PSK"
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_agent_response_rejected_with_unique_psk() {
+        let api = api_state(Store::default()).await;
+        configure_psks(&api).await;
+        register_agent(&api, "agent-1", "shared-psk-1234567890").await;
+        register_agent(&api, "agent-2", "shared-psk-1234567890").await;
+        provision_credential(&api, "agent-1", "unique-agent1-psk-123456").await;
+        provision_credential(&api, "agent-2", "unique-agent2-psk-123456").await;
+
+        // Task owned by agent-1.
+        let add_req = AddTaskReq {
+            agent_id: "agent-1".to_owned(),
+            task: sample_task(),
+        };
+        let Json(queued) = api_add_task(
+            State(api.clone()),
+            operator_headers("api-psk-1234567890"),
+            Json(add_req),
+        )
+        .await
+        .expect("task queued");
+        let task_id = queued.task.task_id.clone();
+
+        // agent-2 posts a response for agent-1's task using agent-2's PSK.
+        let resp_body = serde_json::to_string(&shared::AgentResponse {
+            agent_id: "agent-1".to_owned(),
+            task_id: Some(task_id),
+            output: "x".to_owned(),
+            status: "success".to_owned(),
+        })
+        .unwrap();
+        let headers = signed_agent_headers(
+            "unique-agent2-psk-123456",
+            "POST",
+            "/response",
+            resp_body.as_bytes(),
+            "agent-1",
+        );
+        let resp = handle_response(
+            State(api.clone()),
+            headers,
+            "/response".parse().unwrap(),
+            resp_body,
+        )
+        .await;
+        assert!(
+            resp.is_err(),
+            "agent-2 must not post responses for agent-1"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_psk_persists_to_sqlite() {
+        let (tx, worker, path) = sqlite_worker();
+        persistence::persist(
+            &tx,
+            PersistEvent::AgentPskSet {
+                agent_id: "agent-1".to_owned(),
+                psk: "unique-psk-1234567890".to_owned(),
+            },
+        )
+        .await
+        .expect("psk write should be acknowledged");
+        let conn = persistence::open_db(&path).expect("database should open");
+        let psk: String = conn
+            .query_row(
+                "SELECT psk FROM agent_psks WHERE agent_id = 'agent-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("psk row should exist");
+        assert_eq!(psk, "unique-psk-1234567890");
+        drop(conn);
+        drop(tx);
+        worker.await.expect("worker should drain cleanly");
+        let _ = std::fs::remove_file(path);
     }
 }
