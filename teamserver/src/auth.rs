@@ -19,11 +19,11 @@ use tokio::sync::Mutex;
 /// Allowed clock skew (in seconds) for the HMAC timestamp.
 pub const HMAC_WINDOW_SECONDS: i64 = 60;
 /// Maximum entries kept per principal for replay detection.
-const REPLAY_LRU_CAP: usize = 64;
+pub(crate) const REPLAY_LRU_CAP: usize = 64;
 /// Maximum number of distinct principals tracked in the replay cache.
-const REPLAY_PRINCIPAL_CAP: usize = 4096;
+pub(crate) const REPLAY_PRINCIPAL_CAP: usize = 4096;
 /// Drop replay entries older than this many seconds past the HMAC window.
-const REPLAY_TTL_SECONDS: i64 = HMAC_WINDOW_SECONDS * 2;
+pub(crate) const REPLAY_TTL_SECONDS: i64 = HMAC_WINDOW_SECONDS * 2;
 
 /// Headers
 pub const HDR_TS: &str = "x-nagomio-ts";
@@ -189,6 +189,20 @@ async fn verify_hmac(
     query: &str,
     body: &[u8],
 ) -> AuthResult {
+    verify_hmac_at(headers, auth, principal, psk, method, path, query, body, unix_now()).await
+}
+
+async fn verify_hmac_at(
+    headers: &HeaderMap,
+    auth: &AuthState,
+    principal: &str,
+    psk: &[u8],
+    method: &str,
+    path: &str,
+    query: &str,
+    body: &[u8],
+    now: i64,
+) -> AuthResult {
     let ts = headers
         .get(HDR_TS)
         .and_then(|v| v.to_str().ok())
@@ -213,7 +227,6 @@ async fn verify_hmac(
     let ts_i: i64 = ts
         .parse()
         .map_err(|_| (StatusCode::UNAUTHORIZED, "invalid timestamp".into()))?;
-    let now = unix_now();
     // Checked distance avoids overflow on extreme timestamps.
     let skew = now.abs_diff(ts_i) as i64;
     if skew > HMAC_WINDOW_SECONDS {
@@ -310,6 +323,27 @@ pub fn auth_hmac_for_test(key: &[u8], msg: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::HeaderValue;
+
+    fn signed_headers(
+        psk: &[u8],
+        method: &str,
+        path: &str,
+        query: &str,
+        principal: &str,
+        ts: i64,
+        nonce: &str,
+        body: &[u8],
+    ) -> HeaderMap {
+        let ts_s = ts.to_string();
+        let msg = canonical_message(method, path, query, principal, &ts_s, nonce, body);
+        let mac = auth_hmac_for_test(psk, msg.as_bytes());
+        let mut headers = HeaderMap::new();
+        headers.insert(HDR_TS, HeaderValue::from_str(&ts_s).unwrap());
+        headers.insert(HDR_NONCE, HeaderValue::from_str(nonce).unwrap());
+        headers.insert(HDR_MAC, HeaderValue::from_str(&mac).unwrap());
+        headers
+    }
 
     #[test]
     fn canonical_message_binds_body() {
@@ -323,5 +357,368 @@ mod tests {
         let a = canonical_message("POST", "/beacon", "", "agent-1", "1", "deadbeef", b"");
         let b = canonical_message("POST", "/response", "", "agent-1", "1", "deadbeef", b"");
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn canonical_message_binds_method() {
+        let a = canonical_message("POST", "/beacon", "", "agent-1", "1", "deadbeef", b"");
+        let b = canonical_message("GET", "/beacon", "", "agent-1", "1", "deadbeef", b"");
+        assert_ne!(a, b);
+    }
+
+    #[tokio::test]
+    async fn modified_body_is_rejected() {
+        let auth = AuthState::default();
+        let psk = b"test-psk-for-hmac-body";
+        let now = 1_700_000_000i64;
+        let body = br#"{"agent_id":"agent-1"}"#;
+        let headers = signed_headers(
+            psk,
+            "POST",
+            "/beacon",
+            "",
+            "agent-1",
+            now,
+            "deadbeef",
+            body,
+        );
+        assert!(
+            verify_hmac_at(
+                &headers,
+                &auth,
+                "agent-1",
+                psk,
+                "POST",
+                "/beacon",
+                "",
+                body,
+                now,
+            )
+            .await
+            .is_ok()
+        );
+        let tampered = br#"{"agent_id":"agent-2"}"#;
+        let err = verify_hmac_at(
+            &headers,
+            &auth,
+            "agent-1",
+            psk,
+            "POST",
+            "/beacon",
+            "",
+            tampered,
+            now,
+        )
+        .await;
+        assert!(matches!(err, Err((StatusCode::UNAUTHORIZED, _))));
+    }
+
+    #[tokio::test]
+    async fn changed_route_is_rejected() {
+        let auth = AuthState::default();
+        let psk = b"test-psk-for-hmac-route";
+        let now = 1_700_000_000i64;
+        let body = b"{}";
+        let headers = signed_headers(
+            psk,
+            "POST",
+            "/beacon",
+            "",
+            "agent-1",
+            now,
+            "cafebabe",
+            body,
+        );
+        let err = verify_hmac_at(
+            &headers,
+            &auth,
+            "agent-1",
+            psk,
+            "POST",
+            "/response",
+            "",
+            body,
+            now,
+        )
+        .await;
+        assert!(matches!(err, Err((StatusCode::UNAUTHORIZED, _))));
+    }
+
+    #[tokio::test]
+    async fn changed_method_is_rejected() {
+        let auth = AuthState::default();
+        let psk = b"test-psk-for-hmac-method";
+        let now = 1_700_000_000i64;
+        let body = b"{}";
+        let headers = signed_headers(
+            psk,
+            "POST",
+            "/beacon",
+            "",
+            "agent-1",
+            now,
+            "feedface",
+            body,
+        );
+        let err = verify_hmac_at(
+            &headers,
+            &auth,
+            "agent-1",
+            psk,
+            "GET",
+            "/beacon",
+            "",
+            body,
+            now,
+        )
+        .await;
+        assert!(matches!(err, Err((StatusCode::UNAUTHORIZED, _))));
+    }
+
+    #[tokio::test]
+    async fn replay_is_rejected_within_ttl() {
+        let auth = AuthState::default();
+        let psk = b"test-psk-for-hmac-replay";
+        let now = 1_700_000_000i64;
+        let body = b"{}";
+        let headers = signed_headers(
+            psk,
+            "POST",
+            "/beacon",
+            "",
+            "agent-1",
+            now,
+            "aabbccdd",
+            body,
+        );
+        assert!(
+            verify_hmac_at(
+                &headers,
+                &auth,
+                "agent-1",
+                psk,
+                "POST",
+                "/beacon",
+                "",
+                body,
+                now,
+            )
+            .await
+            .is_ok()
+        );
+        let err = verify_hmac_at(
+            &headers,
+            &auth,
+            "agent-1",
+            psk,
+            "POST",
+            "/beacon",
+            "",
+            body,
+            now + 1,
+        )
+        .await;
+        assert!(matches!(err, Err((StatusCode::UNAUTHORIZED, _))));
+    }
+
+    #[tokio::test]
+    async fn replay_entry_expires_after_ttl() {
+        let auth = AuthState::default();
+        let psk = b"test-psk-for-hmac-ttl";
+        let t0 = 1_700_000_000i64;
+        let body = b"{}";
+        let headers = signed_headers(
+            psk,
+            "POST",
+            "/beacon",
+            "",
+            "agent-1",
+            t0,
+            "11223344",
+            body,
+        );
+        assert!(
+            verify_hmac_at(
+                &headers,
+                &auth,
+                "agent-1",
+                psk,
+                "POST",
+                "/beacon",
+                "",
+                body,
+                t0,
+            )
+            .await
+            .is_ok()
+        );
+        // Immediate replay rejected.
+        assert!(
+            verify_hmac_at(
+                &headers,
+                &auth,
+                "agent-1",
+                psk,
+                "POST",
+                "/beacon",
+                "",
+                body,
+                t0 + 1,
+            )
+            .await
+            .is_err()
+        );
+        // After TTL the same (ts, mac) may be accepted again because the
+        // replay entry has been evicted. The timestamp itself must still be
+        // within the HMAC window relative to `now`, so re-sign at the new time.
+        let t1 = t0 + REPLAY_TTL_SECONDS + 1;
+        let headers2 = signed_headers(
+            psk,
+            "POST",
+            "/beacon",
+            "",
+            "agent-1",
+            t1,
+            "11223344",
+            body,
+        );
+        // Fresh request at t1 succeeds (different ts => different mac).
+        assert!(
+            verify_hmac_at(
+                &headers2,
+                &auth,
+                "agent-1",
+                psk,
+                "POST",
+                "/beacon",
+                "",
+                body,
+                t1,
+            )
+            .await
+            .is_ok()
+        );
+        // Seed an expired entry directly and confirm eviction allows a new
+        // request for the same principal after TTL.
+        {
+            let mut cache = auth.replay.lock().await;
+            let bucket = cache.seen.entry("agent-ttl".to_owned()).or_default();
+            bucket.clear();
+            bucket.push_back((t0, "expired-mac".to_owned()));
+        }
+        let headers3 = signed_headers(
+            psk,
+            "POST",
+            "/beacon",
+            "",
+            "agent-ttl",
+            t1,
+            "55667788",
+            body,
+        );
+        assert!(
+            verify_hmac_at(
+                &headers3,
+                &auth,
+                "agent-ttl",
+                psk,
+                "POST",
+                "/beacon",
+                "",
+                body,
+                t1,
+            )
+            .await
+            .is_ok()
+        );
+        let cache = auth.replay.lock().await;
+        let bucket = cache.seen.get("agent-ttl").expect("principal bucket");
+        assert!(
+            !bucket.iter().any(|(t, m)| *t == t0 && m == "expired-mac"),
+            "stale replay entry must be evicted after TTL"
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_principal_capacity_rejects_when_full() {
+        let auth = AuthState::default();
+        let psk = b"test-psk-for-hmac-cap";
+        let now = 1_700_000_000i64;
+        let body = b"{}";
+        // Fill the principal cache to capacity with fresh entries.
+        {
+            let mut cache = auth.replay.lock().await;
+            for i in 0..REPLAY_PRINCIPAL_CAP {
+                let mut bucket = VecDeque::new();
+                bucket.push_back((now, format!("mac-{i}")));
+                cache.seen.insert(format!("principal-{i}"), bucket);
+            }
+        }
+        let headers = signed_headers(
+            psk,
+            "POST",
+            "/beacon",
+            "",
+            "new-principal",
+            now,
+            "99aabbcc",
+            body,
+        );
+        let err = verify_hmac_at(
+            &headers,
+            &auth,
+            "new-principal",
+            psk,
+            "POST",
+            "/beacon",
+            "",
+            body,
+            now,
+        )
+        .await;
+        assert!(matches!(err, Err((StatusCode::SERVICE_UNAVAILABLE, _))));
+    }
+
+    #[tokio::test]
+    async fn replay_principal_capacity_frees_stale_slots() {
+        let auth = AuthState::default();
+        let psk = b"test-psk-for-hmac-cap-free";
+        let now = 1_700_000_000i64;
+        let body = b"{}";
+        {
+            let mut cache = auth.replay.lock().await;
+            for i in 0..REPLAY_PRINCIPAL_CAP {
+                let mut bucket = VecDeque::new();
+                // All entries older than TTL so they are eligible for eviction.
+                bucket.push_back((now - REPLAY_TTL_SECONDS - 10, format!("mac-{i}")));
+                cache.seen.insert(format!("stale-{i}"), bucket);
+            }
+        }
+        let headers = signed_headers(
+            psk,
+            "POST",
+            "/beacon",
+            "",
+            "fresh-principal",
+            now,
+            "ddeeff00",
+            body,
+        );
+        assert!(
+            verify_hmac_at(
+                &headers,
+                &auth,
+                "fresh-principal",
+                psk,
+                "POST",
+                "/beacon",
+                "",
+                body,
+                now,
+            )
+            .await
+            .is_ok(),
+            "stale principals must be evicted to free capacity"
+        );
     }
 }

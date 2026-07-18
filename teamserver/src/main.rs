@@ -2017,6 +2017,7 @@ async fn api_delete_agent(
         let found = s.store.agents.remove(&agent_id).is_some();
         s.store.pending_tasks.remove(&agent_id);
         s.store.responses.remove(&agent_id);
+        s.store.agent_psks.remove(&agent_id);
         s.store
             .tasks
             .retain(|_, task| task.agent_id != agent_id);
@@ -2074,6 +2075,27 @@ async fn api_set_agent_credential(
         ));
     }
 
+    let persist_tx = {
+        let s = api.shared.lock().await;
+        if !s.store.agents.contains_key(&agent_id) {
+            return Err((
+                StatusCode::NOT_FOUND,
+                format!("agent {} not found", agent_id),
+            ));
+        }
+        s.persist_tx.clone()
+    };
+    // Durable write first so a failed persistence does not leave a live memory-only
+    // credential. Drop the store lock before awaiting the worker.
+    persistence::persist(
+        &persist_tx,
+        PersistEvent::AgentPskSet {
+            agent_id: agent_id.clone(),
+            psk: psk.to_owned(),
+        },
+    )
+    .await
+    .map_err(|err| (StatusCode::SERVICE_UNAVAILABLE, format!("persistence failed: {err}")))?;
     {
         let mut s = api.shared.lock().await;
         if !s.store.agents.contains_key(&agent_id) {
@@ -2085,15 +2107,6 @@ async fn api_set_agent_credential(
         s.store
             .agent_psks
             .insert(agent_id.clone(), psk.to_owned());
-        persistence::persist(
-            &s.persist_tx,
-            PersistEvent::AgentPskSet {
-                agent_id: agent_id.clone(),
-                psk: psk.to_owned(),
-            },
-        )
-        .await
-        .map_err(|err| (StatusCode::SERVICE_UNAVAILABLE, format!("persistence failed: {err}")))?;
     }
     Ok(StatusCode::NO_CONTENT)
 }
