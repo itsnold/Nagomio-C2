@@ -67,7 +67,10 @@ checked server-side so one agent cannot complete another's tasks.
 
 When `NAGOMIO_WIRE_ENCRYPTION=1` on the teamserver, `/beacon` and `/response`
 HTTP bodies are sealed using ChaCha20-Poly1305 with a key derived from the
-PSK via HKDF-SHA256. The directional context strings are
+PSK via RFC 5869 HKDF-SHA256 (salt = empty / HashLen zeros). Linux agents use
+OpenSSL; Windows agents use BCrypt HMAC + `BCRYPT_CHACHA20_POLY1305`. Both
+must match the teamserver bit-for-bit (see `teamserver` wire KAT tests and
+`agent/tests/wire_kat.cpp`). The directional context strings are
 `nagomio/agent/v1` (agent → server) and `nagomio/server/v1` (server → agent).
 The server requires the expected direction on open. When wire encryption is
 **off**, replies stay plaintext even if a PSK is configured.

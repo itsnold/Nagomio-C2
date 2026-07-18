@@ -19,6 +19,7 @@ STATIC_RUNTIME="${STATIC_RUNTIME:-false}"
 XOR_CONFIG="${XOR_CONFIG:-false}"
 XOR_KEY="${XOR_KEY:-90}"
 ENCRYPT_PAYLOAD="${ENCRYPT_PAYLOAD:-false}"
+WIRE_ENCRYPTION="${WIRE_ENCRYPTION:-false}"
 
 auth_args=()
 if [[ -n "${NAGOMIO_API_TOKEN:-}" ]]; then
@@ -45,5 +46,6 @@ curl -sS -X POST "${TEAMSERVER_URL}/api/payload/build" \
     \"static_runtime\": ${STATIC_RUNTIME},
     \"xor_config\": ${XOR_CONFIG},
     \"xor_key\": ${XOR_KEY},
-    \"encrypt_payload\": ${ENCRYPT_PAYLOAD}
+    \"encrypt_payload\": ${ENCRYPT_PAYLOAD},
+    \"wire_encryption\": ${WIRE_ENCRYPTION}
   }"

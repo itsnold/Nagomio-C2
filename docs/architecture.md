@@ -44,7 +44,7 @@
 ## Wire envelope
 
 - AAD = directional context (`nagomio/agent/v1` or `nagomio/server/v1`).
-- Key = `HKDF-SHA256(ikm=psk, salt=32 zero bytes, info=ctx)[..32]`.
+- Key = `HKDF-SHA256(ikm=psk, salt=empty/HashLen zero bytes, info=ctx)[..32]` (RFC 5869; empty salt ≡ 32 zero bytes for SHA-256).
 - 12-byte random nonce, 16-byte Poly1305 tag.
 - Single-line JSON envelope `{nonce, ct, tag, ctx}`.
 
